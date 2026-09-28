@@ -134,6 +134,7 @@ describe("PDF page render ownership", () => {
 
 describe("direct PDF interaction policy", () => {
   test("does not route direct PDF clicks into Typst inverse sync", async () => {
+
     const controller = await Bun.file(new URL("../src/appController.ts", import.meta.url)).text();
     const clickStart = controller.indexOf("private async handlePdfPreviewClick");
     const clickEnd = controller.indexOf("private async ensurePdfSyncSocket", clickStart);
@@ -146,5 +147,28 @@ describe("direct PDF interaction policy", () => {
     const statusSource = controller.slice(statusStart, statusEnd);
     expect(statusSource).toContain("!isTypstDocumentPath(this.activeFilePath)");
     expect(statusSource).toContain("source synchronization is disabled for direct PDF documents");
+  });
+
+  test("keeps the PDF point beneath the mouse fixed while wheel zooming", async () => {
+    const source = await Bun.file(new URL("../src/preview/previewFrame.ts", import.meta.url)).text();
+    expect(source).toContain("const zoomAnchor = pointer ? this.captureZoomAnchor(pointer) : null");
+    expect(source).toContain("doc.elementFromPoint(pointer.x, pointer.y)");
+    expect(source).toContain("documentX: localX / Math.max(scale.x, Number.EPSILON)");
+    expect(source).toContain("pageLeft + anchor.documentX * scale.x - anchor.x");
+    expect(source).toContain("pageTop + anchor.documentY * scale.y - anchor.y");
+    expect(source).toContain("this.zoomIn(pointer)");
+    expect(source).toContain("this.zoomOut(pointer)");
+    expect(source).toContain("event.ctrlKey || event.metaKey");
+  });
+
+  test("pans both preview axes with a captured middle-button drag", async () => {
+    const source = await Bun.file(new URL("../src/preview/previewFrame.ts", import.meta.url)).text();
+    expect(source).toContain("event.button === 1");
+    expect(source).toContain("setPointerCapture(event.pointerId)");
+    expect(source).toContain("releasePointerCapture(event.pointerId)");
+    expect(source).toContain("view.scrollTo(middlePan.scrollX + middlePan.startX - event.clientX");
+    expect(source).toContain('doc.addEventListener("auxclick"');
+    expect(source).toContain("if (mouse.button !== 0)");
+    expect(source).toContain("preview-middle-panning");
   });
 });

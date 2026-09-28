@@ -30,4 +30,13 @@ describe("runtime titlebar selection", () => {
       simulated: false,
     });
   });
+
+  test("uses one native drag mechanism across the complete custom titlebar", async () => {
+    const markup = await Bun.file(new URL("../index.html", import.meta.url)).text();
+    const controller = await Bun.file(new URL("../src/appController.ts", import.meta.url)).text();
+    expect(markup).toContain('class="titlebar-left" data-tauri-drag-region');
+    expect(markup).toContain('class="titlebar-center" data-tauri-drag-region');
+    expect(markup).toContain('class="titlebar-right" data-tauri-drag-region');
+    expect(controller).not.toContain("appWindow.startDragging()");
+  });
 });

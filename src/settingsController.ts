@@ -6,9 +6,15 @@ import {
   normalizeAppSettings,
   type AppSettings,
   type PreviewRenderMode,
+  type PreviewQualityMode,
   type TerminologyEntry,
   type ThemeName
 } from "./settings";
+import {
+  normalizeInsertionTemplateLayer,
+  type InsertionTemplateLayer
+} from "./editor/insertionTemplates";
+import { InsertionTemplateSettingsController } from "./editor/insertionTemplateSettings";
 import {
   unicodeEditorFonts,
   unicodeFontPreferenceOptions,
@@ -68,6 +74,9 @@ export class SettingsController {
   private loadError: string | null = null;
   private systemFonts: SystemFontCatalog = { all: ["MiSans Latin"], monospace: ["Fira Mono"] };
   private readonly timingEntries: SettingsTimingEntry[] = [];
+  private projectInsertionTemplates: InsertionTemplateLayer | null = null;
+  private updateProjectInsertionTemplates: (layer: InsertionTemplateLayer) => void = () => {};
+  private insertionTemplateSettingsController: InsertionTemplateSettingsController | null = null;
   private projectTerminology: TerminologyEntry[] = [];
   private rendererCompatibility: LinuxRendererCompatibility | null = null;
   private rendererCompatibilityError: string | null = null;
@@ -160,9 +169,19 @@ export class SettingsController {
     this.populatePanel();
   }
 
+  public setProjectInsertionTemplates(
+    layer: InsertionTemplateLayer | null,
+    update?: (layer: InsertionTemplateLayer) => void
+  ): void {
+    this.projectInsertionTemplates = layer ? normalizeInsertionTemplateLayer(layer) : null;
+    this.updateProjectInsertionTemplates = update ?? (() => {});
+    this.populateInsertionTemplates();
+  }
+
   public initializePanel() {
     const overlay = document.getElementById("settings-overlay");
     if (!overlay) return;
+    this.initializeInsertionTemplateControls();
     this.populateFontOptions();
     document.getElementById("settings-khmer-prep-field")?.classList.toggle("hidden", !import.meta.env.DEV);
 
@@ -219,7 +238,13 @@ export class SettingsController {
     onChange("settings-indent-guides", (settings, control) => { settings.editor.indentationGuides = (control as HTMLInputElement).checked; });
     onChange("settings-spellcheck", (settings, control) => { settings.editor.spellcheck = (control as HTMLInputElement).checked; });
     onChange("settings-word-completion", (settings, control) => { settings.editor.wordCompletion = (control as HTMLInputElement).checked; });
+    onChange("settings-keep-main-preview", (settings, control) => { settings.editor.keepMainFilePreview = (control as HTMLInputElement).checked; });
+    onChange("settings-project-path-completion", (settings, control) => { settings.editor.projectPathCompletion = (control as HTMLInputElement).checked; });
+    onChange("settings-file-drop-import", (settings, control) => { settings.editor.fileDropImport = (control as HTMLInputElement).checked; });
+    onChange("settings-file-drop-image-directory", (settings, control) => { settings.editor.fileDropImageDirectory = control.value; });
+    onChange("settings-file-drop-document-directory", (settings, control) => { settings.editor.fileDropDocumentDirectory = control.value; });
     onChange("settings-show-zws", (settings, control) => { settings.editor.showZws = (control as HTMLInputElement).checked; });
+    onChange("settings-file-drop-create-figures", (settings, control) => { settings.editor.fileDropCreateFigures = (control as HTMLInputElement).checked; });
     onChange("settings-format-on-save", (settings, control) => { settings.editor.formatOnSave = (control as HTMLInputElement).checked; });
     document.getElementById("settings-add-private-font-directory")?.addEventListener("click", () => {
       void this.addPrivateFontDirectory();
@@ -235,8 +260,12 @@ export class SettingsController {
       this.updateWorkspacePreviewRenderMode(mode);
       this.populatePanel();
     });
+    onChange("settings-preview-quality", (settings, control) => { settings.preview.quality = control.value as PreviewQualityMode; });
     onChange("settings-cursor-sync", (settings, control) => { settings.preview.cursorSync = (control as HTMLInputElement).checked; });
     onChange("settings-sync-debounce", (settings, control) => { settings.preview.syncDebounceMs = Number(control.value); });
+    onChange("settings-on-type-rate-limit", (settings, control) => {
+      settings.preview.onTypeRateLimitSeconds = control.value === "" ? 0 : Number(control.value);
+    });
     onChange("settings-forward-sync-timeout", (settings, control) => {
       settings.preview.forwardSyncTimeoutMs = Number(control.value);
     });
@@ -290,6 +319,21 @@ export class SettingsController {
     this.populatePanel();
   }
 
+  private initializeInsertionTemplateControls(): void {
+    this.insertionTemplateSettingsController ??= new InsertionTemplateSettingsController({
+      getGlobal: () => this.settings.editor.insertionTemplates,
+      setGlobal: layer => this.update(settings => { settings.editor.insertionTemplates = layer; }),
+      getProject: () => this.projectInsertionTemplates,
+      setProject: layer => { this.projectInsertionTemplates = layer; this.updateProjectInsertionTemplates(layer); }
+    });
+    this.insertionTemplateSettingsController.initialize();
+  }
+
+  private populateInsertionTemplates(): void {
+    this.initializeInsertionTemplateControls();
+    this.insertionTemplateSettingsController?.render();
+  }
+
   private async persist(): Promise<boolean> {
     const status = document.getElementById("settings-save-status");
     if (status) status.textContent = "Saving...";
@@ -336,9 +380,16 @@ export class SettingsController {
     setValue("settings-code-font", editor.codeFont);
     setValue("settings-unicode-font", editor.unicodeFont);
     setValue("settings-tab-size", String(editor.tabSize));
+    setValue("settings-file-drop-image-directory", editor.fileDropImageDirectory);
+    setValue("settings-file-drop-document-directory", editor.fileDropDocumentDirectory);
     const effectivePreviewRenderMode = this.workspacePreviewRenderMode ?? preview.renderMode;
     setValue("settings-preview-render-mode", effectivePreviewRenderMode);
+    setValue("settings-preview-quality", preview.quality);
     setValue("settings-sync-debounce", String(preview.syncDebounceMs));
+    setValue(
+      "settings-on-type-rate-limit",
+      preview.onTypeRateLimitSeconds === 0 ? "" : String(preview.onTypeRateLimitSeconds)
+    );
     setValue("settings-forward-sync-timeout", String(preview.forwardSyncTimeoutMs));
     setValue("settings-highlight-duration", String(preview.highlightDurationMs));
     setChecked("settings-word-wrap", editor.wordWrap);
@@ -348,6 +399,20 @@ export class SettingsController {
     setChecked("settings-indent-guides", editor.indentationGuides);
     setChecked("settings-spellcheck", editor.spellcheck);
     setChecked("settings-word-completion", editor.wordCompletion);
+    setChecked("settings-keep-main-preview", editor.keepMainFilePreview);
+    setChecked("settings-project-path-completion", editor.projectPathCompletion);
+    setChecked("settings-file-drop-import", editor.fileDropImport);
+    setChecked("settings-file-drop-create-figures", editor.fileDropCreateFigures);
+    for (const id of ["settings-file-drop-image-directory", "settings-file-drop-document-directory"]) {
+      const control = document.getElementById(id) as HTMLInputElement | null;
+      if (control) {
+        control.disabled = !editor.fileDropImport;
+        control.title = editor.fileDropImport
+          ? "Project-relative directory. Leave blank to use the active Typst file's directory."
+          : "Enable drag-and-drop file importing to configure this directory.";
+      }
+    }
+    this.populateInsertionTemplates();
     setChecked("settings-show-zws", editor.showZws);
     setChecked("settings-format-on-save", editor.formatOnSave);
     this.populatePrivateFontDirectories();
@@ -372,6 +437,13 @@ export class SettingsController {
       previewDebounce.disabled = effectivePreviewRenderMode !== "on-type";
       previewDebounce.title = effectivePreviewRenderMode === "on-type"
         ? "Wait this long after the latest edit before updating the preview."
+        : "Available when Render preview is set to On type.";
+    }
+    const onTypeRateLimit = document.getElementById("settings-on-type-rate-limit") as HTMLInputElement | null;
+    if (onTypeRateLimit) {
+      onTypeRateLimit.disabled = effectivePreviewRenderMode !== "on-type";
+      onTypeRateLimit.title = effectivePreviewRenderMode === "on-type"
+        ? "Optional minimum number of seconds between automatic preview updates. Leave blank for no rate limit."
         : "Available when Render preview is set to On type.";
     }
     setChecked("settings-khmer-prep", preview.khmerRenderPreparation);

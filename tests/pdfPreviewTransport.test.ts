@@ -102,10 +102,9 @@ describe("compiled PDF transport", () => {
     expect(source).toContain(
       'const useEditorOverlays = this.effectivePreviewRenderMode === "on-type" || force;'
     );
-    expect(source).toContain("const tabsToOverlay = useEditorOverlays");
-    expect(source).toMatch(
-      /if\s*\(\s*useEditorOverlays\s*&&[\s\S]*?!overlaid\.has\(filePathKey\(originalActivePath\)\)/
-    );
+    expect(source).toContain("const overlays = useEditorOverlays ? this.editorRenderOverlays(contents) : [];");
+    expect(source).toContain("\"prepare_render_project\", { options, overlays }");
+    expect(source).not.toContain("const tabsToOverlay = useEditorOverlays");
   });
 
   test("keeps editor diagnostics on original sources and recompiles explicit saves in either mode", async () => {

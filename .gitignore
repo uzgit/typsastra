@@ -9,6 +9,7 @@ bun-debug.log
 dist/
 dist-ssr/
 artifacts/
+/Release/
 
 # Generated PDF.js resources
 public/cmaps/
@@ -38,6 +39,7 @@ crates/*/target/
 Thumbs.db
 
 # Others
+/docs/
 implementation-plan.md
 vite.config.ts.timestamp-*.mjs
 assets/debug

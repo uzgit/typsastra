@@ -20,10 +20,10 @@ describe("theme-aware application accents", () => {
     expect(actions).toContain("font: 11px var(--font-family-sans)");
   });
 
-  test("uses the active theme for the no-main-file placeholder", () => {
-    expect(controller).toContain("preview-disabled-title preview-accent-title");
-    expect(controller).not.toContain("color:#3db489");
-    expect(style).toMatch(/\.preview-disabled-title\.preview-accent-title\s*\{[^}]*var\(--ui-accent-color\)/s);
+  test("previews the selected Typst file when no main file is configured", () => {
+    expect(controller).not.toContain("No Main File Selected");
+    expect(controller).toContain("pinnedMainPath: this.pinnedMainFilePath");
+    expect(controller).toContain("currentPreviewCompilationRoot()");
   });
 
   test("shows only Settings in the welcome status bar and scopes render mode to projects", () => {

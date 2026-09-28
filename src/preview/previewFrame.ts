@@ -45,6 +45,8 @@ export type PreviewMemorySnapshot = {
   fontFaces: number;
   activeRenders: number;
   loading: boolean;
+  qualityMode: PreviewQualityMode;
+  displayScale: number;
 };
 
 import { invoke } from "@tauri-apps/api/core";
@@ -52,7 +54,7 @@ import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { PERFORMANCE_BUDGETS, type PerformanceMetric } from "../performance/diagnostics";
 import { formatFileSize } from "../workspace/largeFileOpening";
 import { previewLinkModifierPressed, previewLinkTarget, type PreviewLinkTarget } from "./previewLinks";
-import { pageDimensionsChanged, pagesToEvict, visiblePageIndexes } from "./virtualization";
+import { pageDimensionsChanged, visiblePageIndexes } from "./virtualization";
 import { PreviewMotionController } from "./previewMotion";
 import {
   PreviewRenderScheduler,
@@ -68,6 +70,15 @@ import {
   TYPSASTRA_GREEN_RIPPLE_FILL,
   TYPSASTRA_GREEN_RIPPLE_SHADOW
 } from "../ui/brandColors";
+import {
+  effectivePreviewDisplayScale,
+  normalizePreviewQualityMode,
+  previewPageRenderGeometry,
+  previewQualityPolicy,
+  residentPreviewPagesToEvict,
+  type PreviewPageRenderGeometry,
+  type PreviewQualityMode
+} from "./renderQuality";
 
 type PdfJsModule = typeof import("pdfjs-dist");
 
@@ -100,6 +111,17 @@ type ScrollAnchor = {
   offset: number;
 };
 
+type ZoomPointer = {
+  x: number;
+  y: number;
+};
+
+type ZoomAnchor = ZoomPointer & {
+  pageNo: number;
+  documentX: number;
+  documentY: number;
+};
+
 type ActivePageRender = {
   generation: number;
   renderKey: string;
@@ -109,9 +131,8 @@ type ActivePageRender = {
   canvasCommitted: boolean;
 };
 
-const ZOOM_LEVELS = [25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500];
+const ZOOM_LEVELS = [10, 25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500];
 const FALLBACK_ZOOM_PERCENT = 90;
-const MAX_OUTPUT_SCALE = 2;
 // Local PDFs do not have network latency, but every range still crosses the
 // Tauri IPC boundary. One MiB keeps each allocation bounded while avoiding the
 // several round trips a typical image-heavy page required with 256 KiB chunks.
@@ -171,6 +192,8 @@ export class PreviewFrame {
   private draftHoverRetargetTimer: number | null = null;
   private pendingRestoredScrollTop: number | null = null;
   private previewPointerInside = false;
+  private previewQualityMode: PreviewQualityMode = "balanced";
+  private previewDisplayScale = effectivePreviewDisplayScale(window.devicePixelRatio);
 
   constructor(
     private readonly pane: HTMLElement,
@@ -184,15 +207,20 @@ export class PreviewFrame {
     private readonly onLoadStage?: (
       stage: string,
       detail: Record<string, number | string | boolean>
-    ) => void | Promise<void>
+    ) => void | Promise<void>,
+    private readonly maxManualZoomPercent = 500,
   ) {
     this.pane.addEventListener("wheel", event => {
-      if (event.ctrlKey) {
+      if (event.ctrlKey || event.metaKey) {
         event.preventDefault();
+        const iframeRect = this.iframe?.getBoundingClientRect();
+        const pointer = iframeRect
+          ? { x: event.clientX - iframeRect.left, y: event.clientY - iframeRect.top }
+          : undefined;
         if (event.deltaY < 0) {
-          this.zoomIn();
+          this.zoomIn(pointer);
         } else {
-          this.zoomOut();
+          this.zoomOut(pointer);
         }
       }
     }, { passive: false });
@@ -255,6 +283,29 @@ export class PreviewFrame {
     copy("--ui-bg", "--preview-ui-bg", "#fcfcfc");
     copy("--ui-header-text", "--preview-ui-header", "#616161");
     copy("--ui-accent-color", "--preview-ui-accent", TYPSASTRA_GREEN);
+    copy("--ui-hover", "--preview-surface-bg", "#eeeeee");
+  }
+
+  public setRenderQuality(mode: PreviewQualityMode): void {
+    this.applyOutputConfiguration(normalizePreviewQualityMode(mode), this.previewDisplayScale);
+  }
+
+  public setDisplayScaleFactor(nativeScale: number): void {
+    const nextScale = effectivePreviewDisplayScale(window.devicePixelRatio, nativeScale);
+    this.applyOutputConfiguration(this.previewQualityMode, nextScale);
+  }
+
+  private applyOutputConfiguration(mode: PreviewQualityMode, displayScale: number): void {
+    if (mode === this.previewQualityMode && displayScale === this.previewDisplayScale) return;
+    const anchor = this.captureScrollAnchor();
+    this.previewQualityMode = mode;
+    this.previewDisplayScale = displayScale;
+    if (!this.pdfDoc) return;
+    this.zoomStartedAt = performance.now();
+    this.cancelAllPageRenders();
+    this.layoutPageSlots({ preserveExistingPages: true });
+    this.restoreScrollAnchor(anchor);
+    requestAnimationFrame(() => this.renderVisiblePages());
   }
 
   public suspendResizeLayout(): void {
@@ -279,9 +330,14 @@ export class PreviewFrame {
     }
   }
 
-  public zoomIn(): number {
+  public zoomIn(pointer?: ZoomPointer): number {
     this.isFitToWidth = false;
-    return this.setZoom(ZOOM_LEVELS.find(level => level > this.previewZoomPercent) ?? this.previewZoomPercent);
+    return this.setZoom(
+      ZOOM_LEVELS.find(level => level > this.previewZoomPercent && level <= this.maxManualZoomPercent)
+        ?? this.previewZoomPercent,
+      undefined,
+      pointer
+    );
   }
 
   public memorySnapshot(): PreviewMemorySnapshot {
@@ -302,13 +358,25 @@ export class PreviewFrame {
       canvasPixels: canvases.reduce((total, canvas) => total + canvas.width * canvas.height, 0),
       fontFaces,
       activeRenders: this.activeRenders.size,
-      loading: this.pendingPdfLoadingTask !== null
+      loading: this.pendingPdfLoadingTask !== null,
+      qualityMode: this.previewQualityMode,
+      displayScale: this.previewDisplayScale
     };
   }
 
-  public zoomOut(): number {
+  public setZoomPercent(percent: number): number {
     this.isFitToWidth = false;
-    return this.setZoom([...ZOOM_LEVELS].reverse().find(level => level < this.previewZoomPercent) ?? this.previewZoomPercent);
+    return this.setZoom(Math.min(this.maxManualZoomPercent, Math.max(10, Math.round(percent))));
+  }
+
+  public zoomOut(pointer?: ZoomPointer): number {
+    this.isFitToWidth = false;
+    return this.setZoom(
+      [...ZOOM_LEVELS].reverse().find(level => level < this.previewZoomPercent)
+        ?? this.previewZoomPercent,
+      undefined,
+      pointer
+    );
   }
 
   public zoomToFit(): void {
@@ -338,17 +406,23 @@ export class PreviewFrame {
     this.setZoom(percent, anchor);
   }
 
-  private setZoom(percent: number, preservedAnchor?: ScrollAnchor | null): number {
+  private setZoom(
+    percent: number,
+    preservedAnchor?: ScrollAnchor | null,
+    pointer?: ZoomPointer
+  ): number {
     this.hideDraftImagePopover();
     this.updateHorizontalOverflow();
     if (percent === this.previewZoomPercent) return percent;
     this.zoomStartedAt = performance.now();
-    const anchor = preservedAnchor ?? this.captureScrollAnchor();
+    const zoomAnchor = pointer ? this.captureZoomAnchor(pointer) : null;
+    const scrollAnchor = preservedAnchor ?? (zoomAnchor ? null : this.captureScrollAnchor());
     this.previewZoomPercent = percent;
     this.onZoomChanged?.(percent);
     this.cancelAllPageRenders();
     this.layoutPageSlots({ preserveExistingPages: true });
-    this.restoreScrollAnchor(anchor);
+    if (zoomAnchor) this.restoreZoomAnchor(zoomAnchor);
+    else this.restoreScrollAnchor(scrollAnchor);
     requestAnimationFrame(() => this.renderVisiblePages());
     return percent;
   }
@@ -654,8 +728,7 @@ export class PreviewFrame {
     const iframe = document.createElement("iframe");
     iframe.className = "preview-frame";
     iframe.srcdoc = `<!doctype html><html><head><meta charset="utf-8"><style>
-      :root{--preview-ui-bg:#fcfcfc;--preview-ui-header:#616161;--preview-ui-accent:${TYPSASTRA_GREEN};--preview-surface-bg:#fff;--scrollbar-track:transparent;--scrollbar-thumb:color-mix(in srgb,var(--preview-ui-header) 62%,var(--preview-ui-bg));--scrollbar-hover:color-mix(in srgb,var(--preview-ui-accent) 72%,var(--preview-ui-header))}
-      :root[data-preview-surface="pdf"]{--preview-surface-bg:#b8b8b8}
+      :root{--preview-ui-bg:#fcfcfc;--preview-ui-header:#616161;--preview-ui-accent:${TYPSASTRA_GREEN};--preview-surface-bg:#eeeeee;--scrollbar-track:transparent;--scrollbar-thumb:color-mix(in srgb,var(--preview-ui-header) 62%,var(--preview-ui-bg));--scrollbar-hover:color-mix(in srgb,var(--preview-ui-accent) 72%,var(--preview-ui-header))}
       @supports not selector(::-webkit-scrollbar){html,body{scrollbar-color:var(--scrollbar-thumb) var(--scrollbar-track);scrollbar-width:auto}}
       body::-webkit-scrollbar{width:15px;height:15px}
       body::-webkit-scrollbar-track{background:transparent}
@@ -665,6 +738,7 @@ export class PreviewFrame {
       body::-webkit-scrollbar-button{display:none;width:0;height:0}
       html,body{margin:0;width:100%;height:100%;background:var(--preview-surface-bg)}
       body{overflow:auto;font-family:sans-serif}
+      html.preview-middle-panning,html.preview-middle-panning *{cursor:grabbing!important;user-select:none!important}
       #viewer-container{box-sizing:border-box;min-width:100%;width:max-content;padding:20px;display:flex;flex-direction:column;gap:20px}
       .pdf-page-container{position:relative;box-sizing:border-box;flex:none;margin:0 auto;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.25);overflow:hidden}
       .pdf-page-canvas{position:absolute;inset:0;display:block;width:100%;height:100%}
@@ -726,13 +800,13 @@ export class PreviewFrame {
   private layoutPageSlots(options: { preserveExistingPages?: boolean } = {}): void {
     const doc = this.iframe?.contentDocument;
     if (!doc) return;
-    const zoom = this.previewZoomPercent / 100;
     for (const slot of doc.querySelectorAll<HTMLElement>(".pdf-page-container")) {
       const pageNo = Number(slot.dataset.pageNo);
       const dimensions = this.pageDimensions.get(pageNo);
       if (!dimensions) continue;
-      slot.style.width = `${dimensions.width * zoom}px`;
-      slot.style.height = `${dimensions.height * zoom}px`;
+      const geometry = this.renderGeometry(dimensions);
+      slot.style.width = `${geometry.cssWidth}px`;
+      slot.style.height = `${geometry.cssHeight}px`;
       if (!options.preserveExistingPages) {
         replaceElementChildren(slot);
         delete slot.dataset.renderKey;
@@ -786,9 +860,32 @@ export class PreviewFrame {
     const slot = this.iframe?.contentDocument
       ?.querySelector<HTMLElement>(`.pdf-page-container[data-page-no="${pageNo}"]`);
     if (!slot) return;
-    const zoom = this.previewZoomPercent / 100;
-    slot.style.width = `${dimensions.width * zoom}px`;
-    slot.style.height = `${dimensions.height * zoom}px`;
+    const geometry = this.renderGeometry(dimensions);
+    slot.style.width = `${geometry.cssWidth}px`;
+    slot.style.height = `${geometry.cssHeight}px`;
+  }
+
+  private renderGeometry(dimensions: PageDimensions): PreviewPageRenderGeometry {
+    return previewPageRenderGeometry(
+      dimensions.width,
+      dimensions.height,
+      this.previewZoomPercent,
+      this.previewDisplayScale,
+      this.previewQualityMode
+    );
+  }
+
+  private pageDisplayScale(pageNo: number, slot: HTMLElement): { x: number; y: number } {
+    const dimensions = this.pageDimensions.get(pageNo);
+    const rect = slot.getBoundingClientRect();
+    if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) {
+      const zoom = this.previewZoomPercent / 100;
+      return { x: zoom, y: zoom };
+    }
+    return {
+      x: rect.width / dimensions.width,
+      y: rect.height / dimensions.height
+    };
   }
 
   private installPageObserver(iframe: HTMLIFrameElement): void {
@@ -1032,17 +1129,28 @@ export class PreviewFrame {
       this.pageRenderOwnership.retain(page);
       if (!this.renderIsCurrent(pageNo, active, slot)) return;
 
+      const baseViewport = page.getViewport({ scale: 1 });
+      const dimensions = { width: baseViewport.width, height: baseViewport.height };
+      if (pageDimensionsChanged(this.pageDimensions.get(pageNo), dimensions)) {
+        this.pageDimensions.set(pageNo, dimensions);
+        this.updatePageSlotDimensions(pageNo, dimensions);
+      }
       const cssScale = this.previewZoomPercent / 100;
       const cssViewport = page.getViewport({ scale: cssScale });
-      const outputScale = Math.min(window.devicePixelRatio || 1, MAX_OUTPUT_SCALE);
-      const renderViewport = page.getViewport({ scale: cssScale * outputScale });
+      const geometry = this.renderGeometry(dimensions);
+      slot.style.width = `${geometry.cssWidth}px`;
+      slot.style.height = `${geometry.cssHeight}px`;
       const canvas = doc.createElement("canvas");
       active.canvas = canvas;
       canvas.className = "pdf-page-canvas";
-      canvas.width = Math.max(1, Math.floor(renderViewport.width));
-      canvas.height = Math.max(1, Math.floor(renderViewport.height));
+      canvas.width = geometry.canvasWidth;
+      canvas.height = geometry.canvasHeight;
 
-      const task = page.render({ canvas, viewport: renderViewport });
+      const task = page.render({
+        canvas,
+        viewport: cssViewport,
+        transform: [geometry.renderScaleX, 0, 0, geometry.renderScaleY, 0, 0]
+      });
       active.task = task;
       const canvasStartedAt = performance.now();
       await task.promise;
@@ -1051,14 +1159,23 @@ export class PreviewFrame {
       this.onPerformance?.({
         name: "preview.canvas-render",
         milliseconds: performance.now() - canvasStartedAt,
-        detail: { pageNo, zoomPercent: this.previewZoomPercent }
+        detail: {
+          pageNo,
+          zoomPercent: this.previewZoomPercent,
+          qualityMode: this.previewQualityMode,
+          displayScale: this.previewDisplayScale,
+          outputScaleX: geometry.outputScaleX,
+          outputScaleY: geometry.outputScaleY,
+          canvasWidth: geometry.canvasWidth,
+          canvasHeight: geometry.canvasHeight
+        }
       });
       this.commitFinalCanvas(slot, canvas);
       active.canvasCommitted = true;
       slot.dataset.renderKey = renderKey;
 
       const annotationStartedAt = performance.now();
-      const annotationLinks = await this.renderAnnotationLinks(page, cssViewport, doc);
+      const annotationLinks = await this.renderAnnotationLinks(page, cssViewport, geometry, doc);
       if (!this.renderIsCurrent(pageNo, active, slot)) return;
       this.onPerformance?.({
         name: "preview.annotation-layer",
@@ -1102,7 +1219,12 @@ export class PreviewFrame {
     }
   }
 
-  private async renderAnnotationLinks(page: any, viewport: any, doc: Document): Promise<HTMLElement[]> {
+  private async renderAnnotationLinks(
+    page: any,
+    viewport: any,
+    geometry: PreviewPageRenderGeometry,
+    doc: Document
+  ): Promise<HTMLElement[]> {
     if (typeof page?.getAnnotations !== "function") return [];
     try {
       const annotationLinks: HTMLElement[] = [];
@@ -1111,10 +1233,12 @@ export class PreviewFrame {
         if (!target) continue;
         const rect = viewportRectangle(viewport, annotation.rect);
         if (!rect) continue;
-        const left = Math.max(0, Math.min(rect[0], rect[2]) - 3);
-        const top = Math.max(0, Math.min(rect[1], rect[3]) - 2);
-        const right = Math.min(Number(viewport.width), Math.max(rect[0], rect[2]) + 3);
-        const bottom = Math.min(Number(viewport.height), Math.max(rect[1], rect[3]) + 2);
+        const scaleX = geometry.cssWidth / Number(viewport.width);
+        const scaleY = geometry.cssHeight / Number(viewport.height);
+        const left = Math.max(0, (Math.min(rect[0], rect[2]) - 3) * scaleX);
+        const top = Math.max(0, (Math.min(rect[1], rect[3]) - 2) * scaleY);
+        const right = Math.min(geometry.cssWidth, (Math.max(rect[0], rect[2]) + 3) * scaleX);
+        const bottom = Math.min(geometry.cssHeight, (Math.max(rect[1], rect[3]) + 2) * scaleY);
         const link = doc.createElement("a");
         link.className = `annotation-link ${
           target.kind === "draft-image"
@@ -1155,8 +1279,7 @@ export class PreviewFrame {
   }
 
   private currentPageRenderKey(generation: number): string {
-    const outputScale = Math.min(window.devicePixelRatio || 1, MAX_OUTPUT_SCALE);
-    return `${generation}:${this.previewZoomPercent}:${outputScale}`;
+    return `${generation}:${this.previewZoomPercent}:${this.previewQualityMode}:${this.previewDisplayScale}`;
   }
 
   private commitFinalCanvas(slot: HTMLElement, canvas: HTMLCanvasElement, annotations: HTMLElement[] = []): void {
@@ -1196,10 +1319,26 @@ export class PreviewFrame {
   }
 
   private trimResidentPages(focusPage: number): void {
-    const rendered = this.renderedPageNumbers();
-    if (rendered.length <= PERFORMANCE_BUDGETS.maxResidentPdfPages) return;
-    pagesToEvict(rendered, focusPage, PERFORMANCE_BUDGETS.maxResidentPdfPages)
-      .forEach(pageNo => this.releaseFinalPage(pageNo));
+    const doc = this.iframe?.contentDocument;
+    if (!doc) return;
+    const visible = new Set(this.viewportPageNumbers());
+    const pages = this.renderedPageNumbers().map(pageNo => {
+      const canvas = doc.querySelector<HTMLCanvasElement>(
+        `.pdf-page-container[data-page-no="${pageNo}"] canvas`
+      );
+      return {
+        pageNo,
+        pixels: canvas ? canvas.width * canvas.height : 0,
+        visible: visible.has(pageNo)
+      };
+    });
+    const policy = previewQualityPolicy(this.previewQualityMode);
+    residentPreviewPagesToEvict(
+      pages,
+      focusPage,
+      PERFORMANCE_BUDGETS.maxResidentPdfPages,
+      policy.maxResidentCanvasPixels
+    ).forEach(pageNo => this.releaseFinalPage(pageNo));
   }
 
   private cancelAllPageRenders(): void {
@@ -1286,8 +1425,8 @@ export class PreviewFrame {
     const view = this.iframe?.contentWindow;
     if (!view) return;
 
-    const zoom = this.previewZoomPercent / 100;
-    const targetY = slot.offsetTop + (position.y * zoom) - (view.innerHeight * 0.45);
+    const scale = this.pageDisplayScale(position.page_no, slot);
+    const targetY = slot.offsetTop + (position.y * scale.y) - (view.innerHeight * 0.45);
     this.jumpToPreviewOffset(Math.max(0, targetY), position.page_no);
     if (options.ripple) {
       await this.showForwardSyncRippleAtDocumentPosition(position);
@@ -1304,10 +1443,10 @@ export class PreviewFrame {
     const slot = doc.querySelector<HTMLElement>(`.pdf-page-container[data-page-no="${position.page_no}"]`);
     if (generation !== this.forwardRippleGeneration || !slot) return;
 
-    const zoom = this.previewZoomPercent / 100;
+    const scale = this.pageDisplayScale(position.page_no, slot);
     const slotRect = slot.getBoundingClientRect();
-    const x = slotRect.left + (position.x * zoom);
-    const y = slotRect.top + (position.y * zoom);
+    const x = slotRect.left + (position.x * scale.x);
+    const y = slotRect.top + (position.y * scale.y);
     this.renderForwardSyncRipple(doc, x, y);
   }
 
@@ -1373,6 +1512,56 @@ export class PreviewFrame {
     return { pageNo: Number(anchor.dataset.pageNo), offset: anchor.getBoundingClientRect().top };
   }
 
+  private captureZoomAnchor(pointer: ZoomPointer): ZoomAnchor | null {
+    const doc = this.iframe?.contentDocument;
+    if (!doc) return null;
+    const slots = [...doc.querySelectorAll<HTMLElement>(".pdf-page-container")];
+    if (slots.length === 0) return null;
+    const direct = doc.elementFromPoint(pointer.x, pointer.y)
+      ?.closest<HTMLElement>(".pdf-page-container");
+    const slot = direct ?? slots
+      .map(candidate => {
+        const rect = candidate.getBoundingClientRect();
+        const nearestX = Math.max(rect.left, Math.min(pointer.x, rect.right));
+        const nearestY = Math.max(rect.top, Math.min(pointer.y, rect.bottom));
+        return {
+          slot: candidate,
+          distance: Math.hypot(pointer.x - nearestX, pointer.y - nearestY)
+        };
+      })
+      .sort((left, right) => left.distance - right.distance)[0]?.slot;
+    if (!slot) return null;
+
+    const pageNo = Number(slot.dataset.pageNo);
+    const rect = slot.getBoundingClientRect();
+    const scale = this.pageDisplayScale(pageNo, slot);
+    const localX = Math.max(0, Math.min(pointer.x - rect.left, rect.width));
+    const localY = Math.max(0, Math.min(pointer.y - rect.top, rect.height));
+    return {
+      pageNo,
+      x: pointer.x,
+      y: pointer.y,
+      documentX: localX / Math.max(scale.x, Number.EPSILON),
+      documentY: localY / Math.max(scale.y, Number.EPSILON)
+    };
+  }
+
+  private restoreZoomAnchor(anchor: ZoomAnchor): void {
+    const slot = this.iframe?.contentDocument
+      ?.querySelector<HTMLElement>(`.pdf-page-container[data-page-no="${anchor.pageNo}"]`);
+    const view = this.iframe?.contentWindow;
+    if (!slot || !view) return;
+    const rect = slot.getBoundingClientRect();
+    const pageLeft = rect.left + view.scrollX;
+    const pageTop = rect.top + view.scrollY;
+    const scale = this.pageDisplayScale(anchor.pageNo, slot);
+    view.scrollTo({
+      left: Math.max(0, pageLeft + anchor.documentX * scale.x - anchor.x),
+      top: Math.max(0, pageTop + anchor.documentY * scale.y - anchor.y),
+      behavior: "auto"
+    });
+  }
+
   private captureScrollPosition(): number {
     const view = this.iframe?.contentWindow;
     const doc = this.iframe?.contentDocument;
@@ -1433,24 +1622,54 @@ export class PreviewFrame {
     });
     this.updateGoToFirstPageButton();
     this.debugInverse(`Interaction listener installed: readyState=${doc.readyState}, url=${doc.URL || "(empty)"}.`);
+    let middlePan: { pointerId: number; startX: number; startY: number; scrollX: number; scrollY: number } | null = null;
     doc.addEventListener("contextmenu", event => event.preventDefault());
     doc.addEventListener("pointerdown", event => {
       if ((event.target as Element | null)?.closest("#preview-go-first")) return;
       this.rememberDraftPointer(event);
       window.postMessage({ type: "HIDE_CONTEXT_MENU" }, "*");
+      if (event.button === 1) {
+        const view = this.iframe?.contentWindow;
+        if (!view) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.hideDraftImagePopover();
+        middlePan = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, scrollX: view.scrollX, scrollY: view.scrollY };
+        doc.documentElement.classList.add("preview-middle-panning");
+        doc.documentElement.setPointerCapture(event.pointerId);
+      }
       this.motion.setPointerDown(true);
     }, true);
-    this.iframe?.contentWindow?.addEventListener("pointerup", () => this.motion.setPointerDown(false), true);
-    this.iframe?.contentWindow?.addEventListener("pointercancel", () => this.motion.setPointerDown(false), true);
+    const finishPointerInteraction = (event: PointerEvent) => {
+      if (middlePan?.pointerId === event.pointerId) {
+        event.preventDefault();
+        doc.documentElement.classList.remove("preview-middle-panning");
+        if (doc.documentElement.hasPointerCapture(event.pointerId)) doc.documentElement.releasePointerCapture(event.pointerId);
+        middlePan = null;
+      }
+      this.motion.setPointerDown(false);
+    };
+    this.iframe?.contentWindow?.addEventListener("pointerup", finishPointerInteraction, true);
+    this.iframe?.contentWindow?.addEventListener("pointercancel", finishPointerInteraction, true);
     this.iframe?.contentWindow?.addEventListener("blur", () => {
+      middlePan = null;
+      doc.documentElement.classList.remove("preview-middle-panning");
       this.motion.setPointerDown(false);
       this.setPreviewLinkModifier(doc, false);
     });
     doc.addEventListener("pointermove", event => {
+      if (middlePan?.pointerId === event.pointerId) {
+        const view = this.iframe?.contentWindow;
+        if (!view) return;
+        event.preventDefault();
+        event.stopPropagation();
+        view.scrollTo(middlePan.scrollX + middlePan.startX - event.clientX, middlePan.scrollY + middlePan.startY - event.clientY);
+        return;
+      }
       this.previewPointerInside = true;
       this.rememberDraftPointer(event);
       this.setPreviewLinkModifier(doc, previewLinkModifierPressed(event));
-    }, { passive: true });
+    }, { passive: false });
     doc.addEventListener("pointerover", event => {
       this.previewPointerInside = true;
       this.rememberDraftPointer(event);
@@ -1486,11 +1705,22 @@ export class PreviewFrame {
     doc.addEventListener("keyup", event => {
       this.setPreviewLinkModifier(doc, this.previewPointerInside && previewLinkModifierPressed(event));
     });
+    doc.addEventListener("auxclick", event => {
+      if (event.button !== 1) return;
+      event.preventDefault();
+      event.stopPropagation();
+    }, true);
+
     doc.addEventListener("click", event => {
       const target = event.target as Element | null;
       if (target?.closest("#preview-go-first")) return;
       const annotationLink = target?.closest<HTMLElement>(".annotation-link");
       const mouse = event as MouseEvent;
+      if (mouse.button !== 0) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       if (annotationLink) {
         event.preventDefault();
         const annotationTarget = this.annotationTargets.get(annotationLink);
@@ -1523,12 +1753,13 @@ export class PreviewFrame {
     doc.addEventListener("wheel", event => {
       this.previewPointerInside = true;
       this.rememberDraftPointer(event);
-      if (event.ctrlKey) {
+      if (event.ctrlKey || event.metaKey) {
         event.preventDefault();
+        const pointer = { x: event.clientX, y: event.clientY };
         if (event.deltaY < 0) {
-          this.zoomIn();
+          this.zoomIn(pointer);
         } else {
-          this.zoomOut();
+          this.zoomOut(pointer);
         }
       } else {
         this.scheduleDraftHoverRetarget();
@@ -1618,10 +1849,14 @@ export class PreviewFrame {
     const slotRect = slot.getBoundingClientRect();
     const x = event.clientX - slotRect.left;
     const y = event.clientY - slotRect.top;
-    const zoom = this.previewZoomPercent / 100;
+    const scale = this.pageDisplayScale(pageNo, slot);
     return {
       pageNo,
-      documentPosition: { page_no: pageNo, x: x / zoom, y: y / zoom }
+      documentPosition: {
+        page_no: pageNo,
+        x: x / Math.max(scale.x, Number.EPSILON),
+        y: y / Math.max(scale.y, Number.EPSILON)
+      }
     };
   }
 

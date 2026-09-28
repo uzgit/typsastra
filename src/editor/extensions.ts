@@ -100,6 +100,8 @@ const completionNavigationHandler = Prec.highest(EditorView.domEventHandlers({
       handled = moveCompletionSelection(true, "page")(view);
     } else if (event.key === "PageUp") {
       handled = moveCompletionSelection(false, "page")(view);
+    } else if (event.key === "Tab" && !event.shiftKey) {
+      handled = acceptCompletion(view);
     } else if (event.key === "Enter") {
       handled = acceptCompletion(view);
     }

@@ -17,6 +17,7 @@ export class LayoutController {
   private static readonly dragThresholdPx = 4;
   private readonly interruptResizeCallbacks = new Set<() => void>();
   private dockedInputWidthPct = 50;
+  private previewUndocked = false;
 
   constructor(
     private readonly onLayoutChanged: () => void,
@@ -49,6 +50,10 @@ export class LayoutController {
 
   public getDockedInputWidthPct(): number {
     return this.dockedInputWidthPct;
+  }
+
+  public isPreviewUndocked(): boolean {
+    return this.previewUndocked;
   }
 
   public reconcileDockedPaneWidths(): void {
@@ -117,6 +122,7 @@ export class LayoutController {
   }
 
   public dockPreview(): void {
+    this.previewUndocked = false;
     const previewWrapper = document.getElementById("preview-container-wrapper");
     const resizer = document.getElementById("editor-preview-resizer");
     const input = document.getElementById("input-container-wrapper");
@@ -214,6 +220,7 @@ export class LayoutController {
 
     undock.addEventListener("click", async () => {
       this.captureDockedPaneSize();
+      this.previewUndocked = true;
       previewWrapper.style.display = "none";
       if (resizer) resizer.style.display = "none";
       if (input) input.style.width = "100%";

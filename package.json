@@ -20,7 +20,10 @@
     "tauri:dev:pdf-full": "bun scripts/run-pdf-transport-experiment.ts full",
     "tauri:dev:pdf-range": "bun scripts/run-pdf-transport-experiment.ts range",
     "tauri:release:pdf-full": "bun scripts/run-pdf-transport-experiment.ts full release",
-    "tauri:release:pdf-range": "bun scripts/run-pdf-transport-experiment.ts range release"
+    "tauri:release:pdf-range": "bun scripts/run-pdf-transport-experiment.ts range release",
+    "release": "bun scripts/build-release.ts",
+    "release:appimage": "bun scripts/build-release.ts --bundles appimage",
+    "release:collect": "bun scripts/build-release.ts --collect-only"
   },
   "dependencies": {
     "@babel/runtime": "^8.0.0",

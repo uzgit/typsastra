@@ -24,6 +24,7 @@ mod scaled_fonts;
 mod segmentation;
 mod toolchain;
 mod webview_storage;
+mod workspace_files;
 use compatibility::{get_linux_renderer_compatibility, prepare_linux_renderer_relaunch};
 use examples::prepare_examples_workspace;
 use render_prepare::{
@@ -42,10 +43,35 @@ fn workspace_font_directories(app_local_data_dir: &Path, start: &Path) -> Vec<st
     let cache_root = scaled_fonts::global_scaled_font_root(app_local_data_dir);
     for ancestor in start.ancestors() {
         if ancestor.join(".typsastra").is_dir() {
-            return scaled_fonts::workspace_font_directories(&cache_root, ancestor);
+            let mut paths = scaled_fonts::workspace_font_directories(&cache_root, ancestor);
+            let project_fonts = ancestor.join("fonts");
+            if project_fonts.is_dir() && !paths.iter().any(|path| path == &project_fonts) {
+                paths.push(project_fonts);
+            }
+            return paths;
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod workspace_font_directory_tests {
+    use super::workspace_font_directories;
+
+    #[test]
+    fn includes_project_fonts_directory() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let cache = tempfile::tempdir().expect("create cache");
+        let nested = workspace.path().join("chapters");
+        let fonts = workspace.path().join("fonts");
+        std::fs::create_dir(workspace.path().join(".typsastra")).expect("create metadata");
+        std::fs::create_dir(&nested).expect("create nested directory");
+        std::fs::create_dir(&fonts).expect("create fonts directory");
+
+        let paths = workspace_font_directories(cache.path(), &nested);
+
+        assert!(paths.iter().any(|path| path == &fonts));
+    }
 }
 
 fn configured_private_font_directories(app_handle: &tauri::AppHandle) -> Vec<PathBuf> {
@@ -470,6 +496,29 @@ fn write_json_atomically(path: &Path, value: &serde_json::Value) -> Result<(), S
     Ok(())
 }
 
+fn update_workspace_metadata_ignore(metadata: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(metadata)
+        .map_err(|error| format!("Failed to create {}: {error}", metadata.display()))?;
+    let ignore = metadata.join(".gitignore");
+    let mut ignored = std::fs::read_to_string(&ignore)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.trim() != "fonts/generated/")
+        .collect::<Vec<_>>()
+        .join("\n");
+    for entry in ["workspace.json", "recovery.json", "cache/"] {
+        if !ignored.lines().any(|line| line.trim() == entry) {
+            if !ignored.is_empty() && !ignored.ends_with('\n') {
+                ignored.push('\n');
+            }
+            ignored.push_str(entry);
+            ignored.push('\n');
+        }
+    }
+    std::fs::write(&ignore, ignored)
+        .map_err(|error| format!("Failed to write {}: {error}", ignore.display()))
+}
+
 #[tauri::command]
 fn load_workspace_metadata(
     workspace_root_path: String,
@@ -517,30 +566,51 @@ fn save_workspace_metadata(
     write_json_atomically(&metadata.join("config.json"), &project)?;
     write_json_atomically(&metadata.join("workspace.json"), &workspace)?;
     scaled_fonts::remove_legacy_workspace_fonts(root)?;
-    let ignore = metadata.join(".gitignore");
-    let mut ignored = std::fs::read_to_string(&ignore)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| line.trim() != "fonts/generated/")
-        .collect::<Vec<_>>()
-        .join("\n");
-    for entry in ["workspace.json", "cache/"] {
-        if !ignored.lines().any(|line| line.trim() == entry) {
-            if !ignored.is_empty() && !ignored.ends_with('\n') {
-                ignored.push('\n');
-            }
-            ignored.push_str(entry);
-            ignored.push('\n');
-        }
+    update_workspace_metadata_ignore(&metadata)
+}
+
+#[tauri::command]
+fn load_workspace_recovery(
+    workspace_root_path: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let root = Path::new(&workspace_root_path);
+    if !root.is_dir() {
+        return Err("The workspace root does not exist.".into());
     }
-    std::fs::write(&ignore, ignored)
-        .map_err(|error| format!("Failed to write {}: {error}", ignore.display()))?;
+    read_optional_json(&root.join(".typsastra/recovery.json"))
+}
+
+#[tauri::command]
+fn save_workspace_recovery(
+    workspace_root_path: String,
+    recovery: serde_json::Value,
+) -> Result<(), String> {
+    let root = Path::new(&workspace_root_path);
+    if !root.is_dir() {
+        return Err("The workspace root does not exist.".into());
+    }
+    let metadata = root.join(".typsastra");
+    let recovery_path = metadata.join("recovery.json");
+    let has_tabs = recovery
+        .get("tabs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tabs| !tabs.is_empty());
+    if has_tabs {
+        write_json_atomically(&recovery_path, &recovery)?;
+        update_workspace_metadata_ignore(&metadata)?;
+    } else if recovery_path.exists() {
+        std::fs::remove_file(&recovery_path)
+            .map_err(|error| format!("Failed to remove {}: {error}", recovery_path.display()))?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod workspace_metadata_tests {
-    use super::{load_workspace_metadata, save_workspace_metadata};
+    use super::{
+        load_workspace_metadata, load_workspace_recovery, save_workspace_metadata,
+        save_workspace_recovery,
+    };
 
     #[test]
     fn persists_project_and_session_metadata_inside_workspace() {
@@ -608,6 +678,42 @@ mod workspace_metadata_tests {
             manifest
         );
         assert!(metadata.join("config.json").is_file());
+    }
+
+    #[test]
+    fn atomically_persists_and_clears_dirty_buffer_recovery() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().to_string_lossy().to_string();
+        let recovery = serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAtMs": 42,
+            "tabs": [{
+                "path": "chapter.typ",
+                "content": "unsaved",
+                "selectionAnchor": 7,
+                "selectionHead": 7
+            }]
+        });
+
+        save_workspace_recovery(root.clone(), recovery.clone()).unwrap();
+        assert_eq!(
+            load_workspace_recovery(root.clone()).unwrap(),
+            Some(recovery)
+        );
+        assert!(workspace.path().join(".typsastra/recovery.json").is_file());
+        assert!(
+            std::fs::read_to_string(workspace.path().join(".typsastra/.gitignore"))
+                .unwrap()
+                .lines()
+                .any(|line| line == "recovery.json")
+        );
+
+        save_workspace_recovery(
+            root.clone(),
+            serde_json::json!({ "schemaVersion": 1, "updatedAtMs": 43, "tabs": [] }),
+        )
+        .unwrap();
+        assert_eq!(load_workspace_recovery(root).unwrap(), None);
     }
 }
 
@@ -2103,6 +2209,16 @@ fn resolve_preview_target(
 
     let active_contents =
         file_contents.unwrap_or_else(|| std::fs::read_to_string(&path).unwrap_or_default());
+    // With no configured main, the selected Typst file is the compilation root.
+    if pinned_main_path.is_none() {
+        return Ok(PreviewTarget {
+            root_path: Some(path.to_string_lossy().to_string()),
+            main_path: None,
+            imported: false,
+            standalone: true,
+            disabled: false,
+        });
+    }
     let workspace_root = workspace_root_path
         .map(std::path::PathBuf::from)
         .map(|root| normalized_existing_path(&root))
@@ -2216,18 +2332,60 @@ fn resolve_preview_target(
     })
 }
 
+fn resolve_preview_target_with_policy(
+    file_path: String,
+    workspace_root_path: Option<String>,
+    file_contents: Option<String>,
+    pinned_main_path: Option<String>,
+    always_use_pinned_main: bool,
+) -> Result<PreviewTarget, String> {
+    if always_use_pinned_main {
+        if let Some(pinned) = pinned_main_path.as_deref() {
+            let active = normalized_existing_path(Path::new(&file_path));
+            let pinned = normalized_existing_path(Path::new(pinned));
+            let workspace_contains_main = workspace_root_path
+                .as_deref()
+                .map(Path::new)
+                .map(normalized_existing_path)
+                .is_none_or(|root| pinned.starts_with(root));
+            if active.extension().and_then(|value| value.to_str()) == Some("typ")
+                && pinned.extension().and_then(|value| value.to_str()) == Some("typ")
+                && pinned.is_file()
+                && workspace_contains_main
+            {
+                let imported = active != pinned;
+                return Ok(PreviewTarget {
+                    root_path: Some(pinned.to_string_lossy().to_string()),
+                    main_path: imported.then(|| pinned.to_string_lossy().to_string()),
+                    imported,
+                    standalone: !imported,
+                    disabled: false,
+                });
+            }
+        }
+    }
+    resolve_preview_target(
+        file_path,
+        workspace_root_path,
+        file_contents,
+        pinned_main_path,
+    )
+}
+
 #[tauri::command]
 fn resolve_preview_main(
     file_path: String,
     workspace_root_path: Option<String>,
     file_contents: Option<String>,
     pinned_main_path: Option<String>,
+    always_use_pinned_main: Option<bool>,
 ) -> Result<PreviewTarget, String> {
-    resolve_preview_target(
+    resolve_preview_target_with_policy(
         file_path,
         workspace_root_path,
         file_contents,
         pinned_main_path,
+        always_use_pinned_main.unwrap_or(false),
     )
 }
 
@@ -2805,7 +2963,7 @@ mod preview_main_tests {
     }
 
     #[test]
-    fn imported_file_uses_workspace_main() {
+    fn configured_main_owns_imported_file() {
         let workspace = tempfile::tempdir().expect("create workspace");
         let main_path = workspace.path().join("main.typ");
         let chapter_path = workspace.path().join("chapter.typ");
@@ -2816,7 +2974,7 @@ mod preview_main_tests {
             chapter_path.to_string_lossy().to_string(),
             Some(workspace.path().to_string_lossy().to_string()),
             None,
-            None,
+            Some(main_path.to_string_lossy().to_string()),
         )
         .expect("resolve preview");
 
@@ -2953,7 +3111,7 @@ mod preview_main_tests {
     }
 
     #[test]
-    fn transitive_import_uses_top_level_main() {
+    fn transitive_import_uses_configured_top_level_main() {
         let workspace = tempfile::tempdir().expect("create workspace");
         let main_path = workspace.path().join("main.typ");
         let chapter_path = workspace.path().join("chapter.typ");
@@ -2966,7 +3124,7 @@ mod preview_main_tests {
             helper_path.to_string_lossy().to_string(),
             Some(workspace.path().to_string_lossy().to_string()),
             None,
-            None,
+            Some(main_path.to_string_lossy().to_string()),
         )
         .expect("resolve preview");
 
@@ -2997,6 +3155,65 @@ mod preview_main_tests {
         .expect("resolve preview");
 
         assert!(!resolved.imported);
+    }
+    #[test]
+    fn no_main_previews_the_selected_file_even_when_an_ancestor_imports_it() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let main_path = workspace.path().join("main.typ");
+        let chapter_path = workspace.path().join("chapter.typ");
+        std::fs::write(&main_path, "#include \"chapter.typ\"").expect("write main");
+        std::fs::write(&chapter_path, "Selected chapter").expect("write chapter");
+
+        let resolved = resolve_preview_target(
+            chapter_path.to_string_lossy().to_string(),
+            Some(workspace.path().to_string_lossy().to_string()),
+            None,
+            None,
+        )
+        .expect("resolve selected preview");
+
+        assert_eq!(
+            resolved.root_path.as_deref(),
+            Some(
+                super::normalized_existing_path(&chapter_path)
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(resolved.main_path, None);
+        assert!(!resolved.imported);
+        assert!(resolved.standalone);
+        assert!(!resolved.disabled);
+    }
+
+    #[test]
+    fn configured_policy_keeps_unrelated_file_on_pinned_main() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let main_path = workspace.path().join("main.typ");
+        let notes_path = workspace.path().join("notes.typ");
+        std::fs::write(&main_path, "Main document").expect("write main");
+        std::fs::write(&notes_path, "Unrelated notes").expect("write notes");
+
+        let resolved = super::resolve_preview_target_with_policy(
+            notes_path.to_string_lossy().to_string(),
+            Some(workspace.path().to_string_lossy().to_string()),
+            None,
+            Some(main_path.to_string_lossy().to_string()),
+            true,
+        )
+        .expect("resolve pinned preview");
+
+        assert_eq!(
+            resolved.root_path.as_deref(),
+            Some(
+                super::normalized_existing_path(&main_path)
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(resolved.imported);
+        assert!(!resolved.standalone);
+        assert!(!resolved.disabled);
     }
 }
 
@@ -3896,6 +4113,8 @@ pub fn run() {
             scan_webview_storage,
             load_workspace_metadata,
             save_workspace_metadata,
+            load_workspace_recovery,
+            save_workspace_recovery,
             compile_typst_document,
             check_typst_document,
             read_workspace_file,
@@ -3925,6 +4144,11 @@ pub fn run() {
             rename_workspace_file,
             copy_workspace_file,
             read_workspace_dir,
+            workspace_files::list_workspace_paths,
+            workspace_files::list_workspace_typst_files,
+            workspace_files::import_dropped_workspace_file,
+            workspace_files::move_workspace_entries,
+            workspace_files::copy_workspace_entries,
             move_to_trash,
             reveal_in_explorer,
             resolve_preview_main,

@@ -1,5 +1,5 @@
 import { EditorSelection, EditorState, type Extension } from "@codemirror/state";
-import { historyField } from "@codemirror/commands";
+import { historyField, isolateHistory } from "@codemirror/commands";
 
 export type EditorUndoHistory = unknown;
 
@@ -26,5 +26,24 @@ export function createTabEditorState(options: {
         ? []
         : historyField.init(() => options.undoHistory),
     ],
+  });
+}
+
+/**
+ * Replace a document with a revision read from disk without discarding the
+ * editor's existing undo/redo stacks. Isolating both sides makes every
+ * external revision a distinct history step, even when file-watcher events
+ * arrive close together.
+ */
+export function externalEditorTextUpdate(state: EditorState, doc: string) {
+  const selection = state.selection.main;
+  return state.update({
+    changes: { from: 0, to: state.doc.length, insert: doc },
+    selection: EditorSelection.single(
+      Math.min(selection.anchor, doc.length),
+      Math.min(selection.head, doc.length),
+    ),
+    annotations: isolateHistory.of("full"),
+    userEvent: "input.external",
   });
 }

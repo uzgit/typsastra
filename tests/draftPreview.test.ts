@@ -174,8 +174,9 @@ describe("Draft Preview", () => {
 
     expect(mirror).toContain("collect_reachable_typst_files");
     expect(mirror).toContain("draft_reachable_files");
-    expect(controller).toContain("result.draftReachableFiles");
-    expect(controller).toContain("draftReachableFileKeys.has");
+    expect(controller).toContain("result.dependencyFiles");
+    expect(controller).toContain("this.editorRenderOverlays(contents)");
+    expect(controller).toContain("result.preparedOverlays");
     expect(controller).toContain("documentRootPath: this.draftThumbnailDocumentRootPath");
     expect(thumbnails).toContain("thumbnail_document_namespace");
     expect(thumbnails).toContain("thumbnail_root.join(cache_namespace)");
@@ -204,7 +205,7 @@ describe("Draft Preview", () => {
     expect(controller).toContain("overlayManifestCacheHits");
     expect(controller).toContain("overlayPreparations");
     expect(controller).toContain("result.draftCacheHits");
-    expect(controller).toContain("generated.draftCacheHit");
+    expect(controller).toContain("prepared.draftCacheHit");
     expect(controller).toContain("backendTypMs");
     expect(controller).toContain("backendAssetMs");
     expect(controller).toContain("projectPreparationMs");

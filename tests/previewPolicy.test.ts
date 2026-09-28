@@ -34,11 +34,12 @@ describe("preview policy", () => {
     expect(participatesInPreviewCompilation("C:\\work\\main.typ", "c:/work/main.typ", false)).toBe(true);
     expect(participatesInPreviewCompilation("C:/work/chapter.typ", "C:/work/main.typ", true)).toBe(true);
     expect(participatesInPreviewCompilation("C:/work/notes.typ", "C:/work/main.typ", false)).toBe(false);
-    expect(participatesInPreviewCompilation("C:/work/main.typ", null, false)).toBe(false);
+    expect(participatesInPreviewCompilation("C:/work/main.typ", null, false)).toBe(true);
   });
 
   test("blocks unrelated active files at every preview scheduling boundary", () => {
     expect(activeFileCanRenderPreview("C:/work/main.typ", "C:/work/main.typ", false, false)).toBe(true);
+    expect(activeFileCanRenderPreview("C:/work/selected.typ", null, false, false)).toBe(true);
     expect(activeFileCanRenderPreview("C:/work/chapter.typ", "C:/work/main.typ", true, false)).toBe(true);
     expect(activeFileCanRenderPreview("C:/work/notes.typ", "C:/work/main.typ", false, false)).toBe(false);
     expect(activeFileCanRenderPreview("C:/work/main.typ", "C:/work/main.typ", false, true)).toBe(false);
@@ -58,11 +59,11 @@ describe("preview policy", () => {
       "schedulePdfPreview",
       "handleContentMutation"
     ]) {
-      expect(methodSource(method)).toContain("activeFileCanRenderPreview(");
+      expect(methodSource(method)).toContain("pathParticipatesInCurrentPreview(");
     }
     const preparation = methodSource("async prepareRenderProjectIfNeeded");
-    expect(preparation).toContain("this.pinnedMainFilePath");
-    expect(preparation).toContain("entryFile = this.mapToOriginalPath(this.pinnedMainFilePath)");
+    expect(preparation).toContain("this.currentPreviewCompilationRoot()");
+    expect(preparation).toContain("entryFile = this.mapToOriginalPath(rootPath)");
     expect(preparation).not.toContain('renderMode !== "on-type"');
   });
   test("keeps standalone preview disabled for v1.0", () => {

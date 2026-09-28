@@ -4,6 +4,13 @@ import { undo, redo } from "@codemirror/commands";
 import { openSearchPanel } from "@codemirror/search";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  insertRenderedTemplate,
+  renderInsertionTemplate,
+  type InsertionTemplate
+} from "./insertionTemplates";
+import { createAppIcon, type AppIconName } from "../ui/icons";
+
+import {
   parseLanguageCatalog,
   parseLanguageProviderCapabilitiesList,
   type LanguageCatalogCapabilities,
@@ -32,6 +39,7 @@ export type EditorToolbarDependencies = {
   save: () => Promise<void>;
   syncPreview: (cursor: number) => Promise<void>;
   applyTypography: (config: DocumentTypography, target: "document" | "template") => Promise<boolean>;
+  getInsertionTemplates: () => readonly InsertionTemplate[];
   // TODO: Re-enable when the WYSIWYM layout is ready for use.
   // toggleMode: () => void;
 };
@@ -67,6 +75,7 @@ const wrappers: Record<string, [string, string, string]> = {
 
 export class EditorToolbarController {
   private readonly toolbar = document.getElementById("editor-visual-toolbar")!;
+  private readonly templateStrip = document.getElementById("editor-template-strip");
   private systemFontFamilies: string[] = ["MiSans Latin", "Fira Mono"];
   private privateFontFamilies: string[] = [];
   private scriptFontFamilies: Record<string, string[]> = {};
@@ -99,6 +108,29 @@ export class EditorToolbarController {
 
   public initialize(): void {
     void this.initializeTypographyControls();
+    this.renderTemplateStrip();
+    this.templateStrip?.addEventListener("pointerdown", event => event.preventDefault());
+    this.templateStrip?.addEventListener("click", event => {
+      const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-template-id]");
+      if (button) this.insertTemplate(button.dataset.templateId ?? "");
+    });
+    this.templateStrip?.addEventListener("wheel", event => {
+      if (!this.templateStrip || Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+      this.templateStrip.scrollLeft += event.deltaY;
+      event.preventDefault();
+    }, { passive: false });
+    this.templateStrip?.addEventListener("keydown", event => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      const buttons = [...this.templateStrip!.querySelectorAll<HTMLButtonElement>("[data-template-id]")];
+      const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+      const next = event.key === "ArrowRight"
+        ? Math.min(buttons.length - 1, current + 1)
+        : Math.max(0, current - 1);
+      if (!buttons[next]) return;
+      event.preventDefault();
+      buttons[next].focus();
+      buttons[next].scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
     window.addEventListener("pointermove", this.onTypographyPointerMove, { passive: false });
     window.addEventListener("pointerup", this.onTypographyPointerUp);
     window.addEventListener("pointercancel", this.onTypographyPointerUp);
@@ -785,6 +817,50 @@ export class EditorToolbarController {
       // TODO: Re-enable when the WYSIWYM layout is ready for use.
       // case "toggle-mode": this.dependencies.toggleMode(); break;
     }
+  }
+
+  public renderTemplateStrip(): void {
+    if (!this.templateStrip) return;
+    const buttons = this.dependencies.getInsertionTemplates()
+      .filter(template => template.enabled)
+      .map(template => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "template-strip-button";
+        button.dataset.templateId = template.id;
+        button.title = `Insert ${template.name}`;
+        button.setAttribute("aria-label", `Insert ${template.name}`);
+        button.append(this.templateIcon(template.id));
+        return button;
+      });
+    this.templateStrip.replaceChildren(...buttons);
+    this.templateStrip.classList.toggle("hidden", buttons.length === 0);
+  }
+
+  private templateIcon(id: string): SVGSVGElement {
+    const icons: Record<string, AppIconName> = {
+      table: "table", figure: "image", "raw-code": "squareCode", quote: "quote", grid: "table", columns: "panelLeft",
+      equation: "sigma", bibliography: "bookOpen", outline: "alignJustify", "page-break": "separatorHorizontal",
+      footnote: "notebookText", label: "tag", reference: "link"
+    };
+    return createAppIcon(icons[id] ?? "plus", { size: 14, className: "template-strip-icon" });
+  }
+
+  private insertTemplate(id: string): void {
+    const template = this.dependencies.getInsertionTemplates().find(candidate => candidate.id === id);
+    if (!template) return;
+    const editor = this.dependencies.getEditor();
+    const range = editor.state.selection.main;
+    const selected = editor.state.sliceDoc(range.from, range.to);
+    const rendered = renderInsertionTemplate(template, { selection: selected });
+    const edit = insertRenderedTemplate(editor.state.doc.toString(), range.from, range.to, rendered);
+    editor.dispatch({
+      changes: { from: 0, to: editor.state.doc.length, insert: edit.text },
+      selection: { anchor: edit.selectionFrom, head: edit.selectionTo },
+      scrollIntoView: true,
+      userEvent: "input"
+    });
+    editor.focus();
   }
 
   private applyWysiwymTool(tool: string): void {

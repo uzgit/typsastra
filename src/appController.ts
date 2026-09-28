@@ -3,6 +3,7 @@ import { confirm, message, open, save } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import { getVersion } from "@tauri-apps/api/app";
 import { dirname, join } from "@tauri-apps/api/path";
 import { EditorState, type Extension, type Text } from "@codemirror/state";
@@ -12,7 +13,7 @@ import { foldAll, foldEffect, foldedRanges, indentUnit, unfoldAll, unfoldEffect 
 import { closeBrackets, completionStatus } from "@codemirror/autocomplete";
 import { getEditorExtensions, themeCompartment, getThemeExtension, applyUIThemeVariables, wrapCompartment, lineNumbersCompartment, activeLineCompartment, closeBracketsCompartment, indentationGuidesCompartment, tabSizeCompartment, completionCompartment, languageCompartment, showZwsCompartment, showZeroWidthSpaces, visibleIndentationMarkers } from "./editor/extensions";
 import { typstLanguage } from "./editor/typstLanguage";
-import { createTypstAutocomplete } from "./editor/autocomplete";
+import { createTypstAutocomplete, type WorkspacePathEntry } from "./editor/autocomplete";
 import { cursorRowColumn } from "./editor/verticalCursor";
 import { isForwardSyncContentPosition } from "./editor/forwardSyncEligibility";
 import type { EditorFoldRange } from "./editor/folding";
@@ -29,7 +30,7 @@ import {
   type TypstPackageImport,
   type TypstPackageReference
 } from "./compiler/previewError";
-import type { AppSettings, DeveloperLogCategory, PreviewRenderMode, ThemeName } from "./settings";
+import type { AppSettings, DeveloperLogCategory, PreviewQualityMode, PreviewRenderMode, ThemeName } from "./settings";
 import { SettingsController } from "./settingsController";
 import { fileNameFromPath, filePathFromUri, filePathKey, filePathToUri, nativeFilePath, relativeFilePath, remapFilePath } from "./platform/paths";
 import { isBinaryImagePath, isSupportedInAppPath, isTypstDocumentPath, fileExtension } from "./platform/fileTypes";
@@ -41,7 +42,7 @@ import {
   tinymistDataPlaneFrameKind,
   tinymistDataPlanePositionText
 } from "./preview/tinymistDataPlane";
-import { activeFileCanRenderPreview, allowsStandalonePreview, documentScriptsForPreviewContext, participatesInPreviewCompilation, previewLspMainPath, previewRefreshStyle, previewSessionIdentity, researchDocumentIdentity, sourceMapPreviewTaskId, staleSourceMapTaskIds, tinymistPreviewPreferredSourceColumn, usesTemplateAwareStandaloneRoot, type PreviewTarget, type PreviewRefreshStyle } from "./preview/previewPolicy";
+import { allowsStandalonePreview, documentScriptsForPreviewContext, previewLspMainPath, previewRefreshStyle, previewSessionIdentity, researchDocumentIdentity, sourceMapPreviewTaskId, staleSourceMapTaskIds, tinymistPreviewPreferredSourceColumn, usesTemplateAwareStandaloneRoot, type PreviewTarget, type PreviewRefreshStyle } from "./preview/previewPolicy";
 import { LogConsoleController, spellcheckConsoleGroupKey, type LogConsoleEntryInput } from "./diagnostics/logConsoleController";
 import { EditorFontManager } from "./editor/fontManager";
 import { TabStripController } from "./editor/tabStripController";
@@ -62,6 +63,7 @@ import {
   type LegacyWorkspaceState,
   type WorkspaceMetadata
 } from "./workspace/workspaceStateStore";
+import { WorkspaceRecoveryStore, type WorkspaceRecovery } from "./workspace/workspaceRecoveryStore";
 import { RecentProjectsController, recentProjectShortcutIndex } from "./workspace/recentProjectsController";
 import {
   WorkspaceWatcher,
@@ -103,8 +105,14 @@ import { setImageOptimizationWarningsEffect, type ImageOptimizationWarning } fro
 import {
   captureEditorUndoHistory,
   createTabEditorState,
+  externalEditorTextUpdate,
   type EditorUndoHistory,
 } from "./editor/tabHistory";
+import { droppedFileKind, typstDroppedFilesInsertion, type DroppedFileKind } from "./editor/fileDrop";
+import { resolveInsertionTemplates } from "./editor/insertionTemplates";
+import { structuredDropDocumentEdit } from "./editor/structuredDrop";
+import { updateMovedPathReferences, type WorkspacePathMove } from "./editor/movedPathReferences";
+import { browserTimerDelayMs, onTypePreviewDelayMs } from "./preview/onTypeRateLimit";
 
 import {
   ensureTypographyTemplateApplication,
@@ -118,6 +126,18 @@ import {
 } from "./editor/templateTypography";
 
 type EditorMode = "CODE" | "WYSIWYM";
+type ImportedDroppedWorkspaceFile = {
+  destinationPath: string;
+  referencePath: string;
+  kind: DroppedFileKind;
+  finalStem: string;
+};
+type MovedReferenceFileUpdate = {
+  sourcePath: string;
+  text: string;
+  referenceCount: number;
+};
+
 
 type StartupTimingEntry = {
   source: string;
@@ -211,7 +231,7 @@ type ExamplesWorkspace = {
 type EditorTab = {
   path: string;
   content: string;
-  savedContent: string;
+  savedContent: string | null;
   contentLoaded: boolean;
   isDirty: boolean;
   previewRootPath: string | null;
@@ -316,6 +336,14 @@ type RenderPreparationResult = {
   draftDiagnostics: DraftImageDiagnostic[];
   draftCacheHits: number;
   draftReachableFiles: string[];
+  dependencyFiles: string[];
+  dependencyManifestComplete: boolean;
+  preparedOverlays: Array<{
+    sourcePath: string;
+    generatedPath: string;
+    preparedText: string;
+    draftCacheHit: boolean;
+  }>;
   timings: RenderPreparationTimings;
 };
 
@@ -441,6 +469,9 @@ export class TypsastraWorkspaceController {
   private previewImported = false;
   private previewStandalone = true;
   private previewDisabled = false;
+  private previewDependencyRootKey: string | null = null;
+  private previewDependencyPathKeys = new Set<string>();
+  private previewDependencyManifestComplete: boolean | null = null;
   private pinnedLspMainPath: string | null = null;
   private pinnedMainFilePath: string | null = null;
   private mainDocumentScripts: DocumentTypography["fonts"] = [];
@@ -482,6 +513,7 @@ export class TypsastraWorkspaceController {
   private latestDocumentVersion = 1;
   private diagnosticWaitStartedAt: number | null = null;
   private openTabs: EditorTab[] = [];
+  private workspacePathCompletionCache: { key: string; loadedAt: number; entries: WorkspacePathEntry[] } | null = null;
   private readonly detectedPlainTextPaths = new Set<string>();
   private readonly classifiedUnknownPaths = new Set<string>();
   private suppressFoldStatePersistence = false;
@@ -490,6 +522,10 @@ export class TypsastraWorkspaceController {
   private readonly openedDocumentUris = new Set<string>();
   private lastKhmerRenderPrepState: boolean | undefined = undefined;
   private lastPreviewRenderMode: PreviewRefreshStyle | undefined = undefined;
+  private lastPreviewQualityMode: PreviewQualityMode | undefined = undefined;
+  private lastKeepMainPreviewState: boolean | undefined = undefined;
+  private previewScaleMonitoringStarted = false;
+  private previewScaleUnlisten: (() => void) | null = null;
   private readonly pendingWorkspaceChanges = new Map<string, WorkspaceChange>();
   private workspaceChangeDrainRunning = false;
   private projectImportQueue: Promise<void> = Promise.resolve();
@@ -533,6 +569,7 @@ export class TypsastraWorkspaceController {
   private pdfPreviewGeneratedFiles = new Map<string, { generatedPath: string; preparedText: string }>();
   private pdfPreviewTimer: number | null = null;
   private pdfPreviewScheduleGeneration = 0;
+  private lastOnTypePreviewStartedAt = Number.NEGATIVE_INFINITY;
   private pdfPreparationRevision = 0;
   private pdfPreviewRunning = false;
   private queuedPdfPreviewContents: string | null = null;
@@ -649,6 +686,34 @@ export class TypsastraWorkspaceController {
     if (isPreviewOnlyWindow()) return;
     return this.logMemoryDiagnostics(`PDF ${stage}`, detail);
   });
+  private editorFileZoomIn: (() => void) | null = null;
+  private editorFileZoomOut: (() => void) | null = null;
+  private editorFileZoomFit: (() => void) | null = null;
+  private readonly editorFilePreviewFrame = new PreviewFrame(
+    document.getElementById("editor-file-pdf-surface")!,
+    () => {},
+    undefined,
+    zoomPercent => {
+      const fit = this.editorFilePreviewFrame.isFitMode;
+      const label = document.getElementById("editor-file-zoom-label");
+      if (label) label.textContent = fit ? "Fit" : `${zoomPercent}%`;
+      if (!document.getElementById("editor-file-pdf-surface")?.classList.contains("hidden")) {
+        this.settingsController.update(settings => {
+          settings.appearance.fileViewerZoomPercent = fit ? null : zoomPercent;
+        });
+      }
+    },
+    undefined,
+    status => {
+      const page = document.getElementById("editor-file-viewer-page");
+      if (page) page.textContent = `${status.currentPage} / ${status.pageCount}`;
+    },
+    undefined,
+    undefined,
+    undefined,
+    400,
+  );
+
   private readonly previewSyncController = new PreviewSyncController({
     getEditor: () => this.editorInstance,
     getClient: () => this.lspClient,
@@ -672,6 +737,7 @@ export class TypsastraWorkspaceController {
   );
   private readonly documentLanguageService = new DocumentLanguageService();
   private readonly workspaceStateStore = new WorkspaceStateStore();
+  private readonly workspaceRecoveryStore = new WorkspaceRecoveryStore();
   private readonly recentProjectsController = new RecentProjectsController(
     path => this.openWorkspace(path),
     async path => {
@@ -697,7 +763,8 @@ export class TypsastraWorkspaceController {
     renderWysiwym: markup => this.mapMarkupToWysiwym(markup),
     save: () => this.saveActiveFile(),
     syncPreview: cursor => this.previewSyncController.renderAtCursor(cursor),
-    applyTypography: (config, target) => this.applyTypography(config, target)
+    applyTypography: (config, target) => this.applyTypography(config, target),
+    getInsertionTemplates: () => resolveInsertionTemplates(this.settingsController.value.editor.insertionTemplates, this.workspaceMetadata?.project.insertionTemplates)
     // TODO: Re-enable when the WYSIWYM layout is ready for use.
     // toggleMode: () => this.switchViewLayoutMode()
   });
@@ -710,7 +777,7 @@ export class TypsastraWorkspaceController {
     loadFile: path => this.loadFile(path),
     save: () => this.saveActiveFile(),
     renameWorkspacePath: (oldPath, newPath) => this.renameWorkspacePath(oldPath, newPath),
-    closeTab: path => this.closeEditorTab(path, true),
+    closeTab: path => this.closeTabsUnderWorkspacePath(path),
     closeTabInteractive: path => this.closeEditorTab(path, false),
     closeOtherTabs: path => this.closeOtherTabs(path),
     restartWorkspace: () => this.restartWorkspace(),
@@ -854,6 +921,28 @@ export class TypsastraWorkspaceController {
     await this.saveWorkspaceState();
   }
 
+  private initializePreviewDisplayScale(): void {
+    if (this.previewScaleMonitoringStarted) return;
+    this.previewScaleMonitoringStarted = true;
+    const currentWindow = getCurrentWindow();
+    const applyScale = (nativeScale: number) => {
+      this.previewFrame.setDisplayScaleFactor(nativeScale);
+      this.editorFilePreviewFrame.setDisplayScaleFactor(nativeScale);
+    };
+    void currentWindow.scaleFactor().then(applyScale).catch(() => {
+      applyScale(window.devicePixelRatio || 1);
+    });
+    void currentWindow.onScaleChanged(event => {
+      // Let WebKit update devicePixelRatio before combining it with Tauri's
+      // authoritative native scale-factor event.
+      requestAnimationFrame(() => applyScale(event.payload.scaleFactor));
+    }).then(unlisten => {
+      this.previewScaleUnlisten = unlisten;
+    }).catch(error => {
+      console.warn("Failed to monitor preview display scale:", error);
+    });
+  }
+
   public async bootstrap() {
     const isPreviewWindow = isPreviewOnlyWindow();
     if (isPreviewWindow) {
@@ -873,6 +962,9 @@ export class TypsastraWorkspaceController {
     this.timeStartupSync("initialize editor toolbar", () => this.editorToolbarController.initialize());
     this.timeStartupSync("initialize tab strip", () => this.tabStripController.initialize());
     this.timeStartupSync("bind global events", () => this.bindGlobalEvents());
+    this.timeStartupSync("monitor preview display scale", () => this.initializePreviewDisplayScale());
+    this.timeStartupSync("initialize pane zoom", () => this.initializePaneZoom());
+    this.timeStartupSync("initialize editor file viewer", () => this.initializeEditorFileViewer());
     this.timeStartupSync("initialize layout", () => this.layoutController.initialize());
     this.timeStartupSync("monitor system resume", () => this.systemResumeMonitor.start());
     this.timeStartupSync("initialize word wrap label", () => this.initWordWrap());
@@ -924,6 +1016,9 @@ export class TypsastraWorkspaceController {
     // theme before the window becomes visible.
     await this.settingsController.load();
     await applyUIThemeVariables(this.settingsController.value.appearance.theme);
+    this.previewFrame.setRenderQuality(this.settingsController.value.preview.quality);
+    this.editorFilePreviewFrame.setRenderQuality(this.settingsController.value.preview.quality);
+    this.initializePreviewDisplayScale();
     this.previewFrame.syncTheme();
     
     document.getElementById("preview-zoom-in-btn")?.addEventListener("click", () => {
@@ -967,6 +1062,10 @@ export class TypsastraWorkspaceController {
     
     await listen<ThemeName>("preview-theme-update", (event) => {
       void applyUIThemeVariables(event.payload).then(() => this.previewFrame.syncTheme());
+    });
+    await listen<PreviewQualityMode>("preview-quality-update", event => {
+      this.previewFrame.setRenderQuality(event.payload);
+      this.editorFilePreviewFrame.setRenderQuality(event.payload);
     });
 
     await listen<string | PdfUpdatePayload>("pdf-update", (event) => {
@@ -1092,7 +1191,9 @@ export class TypsastraWorkspaceController {
       inputWrapper?.classList.remove("hidden");
       previewWrapper?.classList.remove("hidden");
       resizer?.classList.remove("hidden");
-      this.layoutController.dockPreview();
+      if (!this.layoutController.isPreviewUndocked()) {
+        this.layoutController.dockPreview();
+      }
     } else {
       inputWrapper?.classList.add("hidden");
       previewWrapper?.classList.add("hidden");
@@ -1156,7 +1257,7 @@ export class TypsastraWorkspaceController {
     this.logConsoleController.setVisible(false);
 
     this.updateWorkspaceViewportVisibility();
-    this.saveWorkspaceState();
+    void this.saveWorkspaceState();
   }
 
   private applySidebarVisibility(): void {
@@ -1176,6 +1277,8 @@ export class TypsastraWorkspaceController {
     const { appearance, editor, preview } = settings;
     document.documentElement.style.setProperty("--editor-font-size", `${appearance.editorFontSize}px`);
     document.documentElement.style.setProperty("--editor-line-height", String(appearance.editorLineHeight));
+    document.documentElement.style.setProperty("--sidebar-zoom", String(appearance.sidebarZoomPercent / 100));
+    document.documentElement.style.setProperty("--log-zoom", String(appearance.logZoomPercent / 100));
     document.documentElement.style.setProperty(
       "--editor-line-height-px",
       `${appearance.editorFontSize * appearance.editorLineHeight}px`,
@@ -1198,11 +1301,25 @@ export class TypsastraWorkspaceController {
       }).catch(() => {});
     }
 
+    const qualityChanged = this.lastPreviewQualityMode !== undefined
+      && this.lastPreviewQualityMode !== preview.quality;
+    this.lastPreviewQualityMode = preview.quality;
+    this.previewFrame.setRenderQuality(preview.quality);
+    this.editorFilePreviewFrame.setRenderQuality(preview.quality);
+    if (qualityChanged && !isPreviewOnlyWindow()) {
+      import("@tauri-apps/api/event").then(({ emit }) => {
+        void emit("preview-quality-update", preview.quality);
+      }).catch(() => {});
+    }
+
     const khmerPrepChanged = this.lastKhmerRenderPrepState !== undefined && this.lastKhmerRenderPrepState !== preview.khmerRenderPreparation;
     this.lastKhmerRenderPrepState = preview.khmerRenderPreparation;
     const renderMode = this.effectivePreviewRenderMode;
     const previewRenderModeChanged = this.lastPreviewRenderMode !== undefined && this.lastPreviewRenderMode !== renderMode;
     this.lastPreviewRenderMode = renderMode;
+    const keepMainPreviewChanged = this.lastKeepMainPreviewState !== undefined
+      && this.lastKeepMainPreviewState !== editor.keepMainFilePreview;
+    this.lastKeepMainPreviewState = editor.keepMainFilePreview;
     if (previewRenderModeChanged && renderMode !== "on-type") {
       if (this.pdfPreviewTimer) {
         window.clearTimeout(this.pdfPreviewTimer);
@@ -1223,7 +1340,7 @@ export class TypsastraWorkspaceController {
 
     if (khmerPrepChanged) {
       void this.prepareRenderProjectIfNeeded().then(() => this.refreshActivePreviewRoot());
-    } else if (previewRenderModeChanged) {
+    } else if (previewRenderModeChanged || keepMainPreviewChanged) {
       void this.refreshActivePreviewRoot();
     }
 
@@ -1242,6 +1359,22 @@ export class TypsastraWorkspaceController {
     const zwsLabel = document.getElementById("zws-label");
     if (zwsLabel) zwsLabel.textContent = editor.showZws ? "Invisibles: On" : "Invisibles: Off";
     if (!preview.cursorSync) this.previewSyncController.clearForward();
+    this.editorToolbarController.renderTemplateStrip();
+  }
+
+  private async workspacePathEntries(): Promise<WorkspacePathEntry[]> {
+    if (!this.workspaceRootPath || !this.activeFilePath || !isTypstDocumentPath(this.activeFilePath)) return [];
+    const key = `${filePathKey(this.workspaceRootPath)}::${filePathKey(this.activeFilePath)}`;
+    const cached = this.workspacePathCompletionCache;
+    if (cached && cached.key === key && performance.now() - cached.loadedAt < 5_000) {
+      return cached.entries;
+    }
+    const entries = await invoke<WorkspacePathEntry[]>("list_workspace_paths", {
+      workspaceRootPath: this.workspaceRootPath,
+      currentFilePath: this.activeFilePath,
+    });
+    this.workspacePathCompletionCache = { key, loadedAt: performance.now(), entries };
+    return entries;
   }
 
   private currentEditorSettingsEffects() {
@@ -1266,6 +1399,8 @@ export class TypsastraWorkspaceController {
         () => this.documentLanguageService.currentGeneration(),
         milliseconds => this.performanceDiagnostics.record({ name: "language.completion", milliseconds }),
         message => this.appendDeveloperLog({ kind: "info", source: "lsp autocomplete", message }),
+        editor.projectPathCompletion,
+        () => this.workspacePathEntries(),
       ))
     ];
   }
@@ -1286,6 +1421,8 @@ export class TypsastraWorkspaceController {
         () => this.documentLanguageService.currentGeneration(),
         milliseconds => this.performanceDiagnostics.record({ name: "language.completion", milliseconds }),
         message => this.appendDeveloperLog({ kind: "info", source: "lsp autocomplete", message }),
+        editor.projectPathCompletion,
+        () => this.workspacePathEntries(),
       ))
     });
   }
@@ -1424,6 +1561,118 @@ export class TypsastraWorkspaceController {
   }
 
 
+  private editorAcceptsFileDrop(): boolean {
+    return this.settingsController.value.editor.fileDropImport
+      && this.activeMode === "CODE"
+      && Boolean(this.workspaceRootPath)
+      && Boolean(this.activeFilePath && isTypstDocumentPath(this.activeFilePath))
+      && Boolean(this.getActiveTab()?.contentLoaded);
+  }
+
+  private async logicalDropCoordinates(position: { x: number; y: number }): Promise<{ x: number; y: number }> {
+    const scaleFactor = await getCurrentWindow().scaleFactor().catch(() => 1);
+    const scale = Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1;
+    return { x: position.x / scale, y: position.y / scale };
+  }
+
+  private async initializeEditorFileDrop(): Promise<void> {
+    await getCurrentWebview().onDragDropEvent(event => {
+      void this.handleEditorDragDropEvent(event.payload);
+    });
+  }
+
+  private async handleEditorDragDropEvent(event: DragDropEvent): Promise<void> {
+    if (event.type === "leave") {
+      this.codeRenderPane.classList.remove("editor-file-drop-active");
+      return;
+    }
+    if (event.type === "over") return;
+
+    const coordinates = await this.logicalDropCoordinates(event.position);
+    const rect = this.codeRenderPane.getBoundingClientRect();
+    const overEditor = coordinates.x >= rect.left
+      && coordinates.x <= rect.right
+      && coordinates.y >= rect.top
+      && coordinates.y <= rect.bottom;
+    const supportedPaths = event.paths.filter(path => droppedFileKind(path) !== null);
+    const accepts = this.editorAcceptsFileDrop() && overEditor && supportedPaths.length > 0;
+    if (event.type === "enter") {
+      this.codeRenderPane.classList.toggle("editor-file-drop-active", accepts);
+      return;
+    }
+
+    this.codeRenderPane.classList.remove("editor-file-drop-active");
+    if (!accepts || !this.workspaceRootPath || !this.activeFilePath) return;
+    const dropPosition = this.editorInstance.posAtCoords(coordinates);
+    if (dropPosition === null) return;
+
+    const activeFilePath = this.activeFilePath;
+    const workspaceRootPath = this.workspaceRootPath;
+    const editorSettings = this.settingsController.value.editor;
+    const now = new Date();
+    const twoDigits = (value: number) => String(value).padStart(2, "0");
+    const dateStamp = `${now.getFullYear()}_${twoDigits(now.getMonth() + 1)}_${twoDigits(now.getDate())}`;
+    try {
+      const imported: ImportedDroppedWorkspaceFile[] = [];
+      for (const sourcePath of supportedPaths) {
+        const kind = droppedFileKind(sourcePath);
+        if (!kind) continue;
+        const destinationDirectory = kind === "image"
+          ? editorSettings.fileDropImageDirectory
+          : editorSettings.fileDropDocumentDirectory;
+        imported.push(await invoke<ImportedDroppedWorkspaceFile>("import_dropped_workspace_file", {
+          sourcePath,
+          workspaceRootPath,
+          currentFilePath: activeFilePath,
+          destinationDirectory: destinationDirectory || null,
+          structured: editorSettings.fileDropCreateFigures,
+          dateStamp: editorSettings.fileDropCreateFigures ? dateStamp : null,
+        }));
+      }
+      if (imported.length === 0) return;
+      if (!this.activeFilePath || filePathKey(this.activeFilePath) !== filePathKey(activeFilePath)) {
+        await message("The files were copied into the project, but the active editor changed before their references could be inserted.", {
+          title: "Files Imported",
+          kind: "warning",
+        });
+        return;
+      }
+      const insertAt = Math.min(dropPosition, this.editorInstance.state.doc.length);
+      let dropWarnings: string[] = [];
+      if (editorSettings.fileDropCreateFigures) {
+        const figure = resolveInsertionTemplates(editorSettings.insertionTemplates, this.workspaceMetadata?.project.insertionTemplates)
+          .find(template => template.id === "figure");
+        if (!figure) throw new Error("The shared Figure template is unavailable.");
+        const edit = structuredDropDocumentEdit(this.editorInstance.state.doc.toString(), insertAt, figure, imported);
+        this.editorInstance.dispatch({
+          changes: { from: 0, to: this.editorInstance.state.doc.length, insert: edit.text },
+          selection: { anchor: edit.selectionFrom, head: edit.selectionTo },
+          userEvent: "input.drop",
+        });
+        dropWarnings = edit.warnings;
+      } else {
+        const insertion = typstDroppedFilesInsertion(imported);
+        this.editorInstance.dispatch({
+          changes: { from: insertAt, insert: insertion },
+          selection: { anchor: insertAt + insertion.length },
+          userEvent: "input.drop",
+        });
+      }
+      this.workspacePathCompletionCache = null;
+      const expanded = this.explorer.expandedDirectoryPaths();
+      await this.explorer.loadWorkspace(workspaceRootPath, expanded);
+      this.explorer.setActiveFile(activeFilePath);
+      this.setLspStatus({
+        kind: "preview-ready",
+        message: dropWarnings.length
+          ? `Imported ${imported.length} file${imported.length === 1 ? "" : "s"}. ${dropWarnings.join(" ")}`
+          : `Imported ${imported.length} file${imported.length === 1 ? "" : "s"}`,
+      });
+    } catch (error) {
+      await message(String(error), { title: "Unable to Import Dropped File", kind: "error" });
+    }
+  }
+
   private initCodeMirror() {
     const initialDocument = "";
     this.editorFontManager.initialize();
@@ -1445,6 +1694,7 @@ export class TypsastraWorkspaceController {
         if (update.docChanged && !this.isLoadingFile) {
           this.previewSyncController.clearForward();
           this.markActiveTabDirty();
+          void this.persistWorkspaceRecovery(update.state.doc);
           if (!update.view.composing) {
             this.scheduleEditorContentMutation(update.state.doc);
             this.spellcheckController.documentChanged(update);
@@ -1508,6 +1758,7 @@ export class TypsastraWorkspaceController {
     // The editor remains mouse- and command-focusable, but ordinary Tab
     // navigation between application controls must never land in source text.
     this.editorInstance.contentDOM.tabIndex = -1;
+    void this.initializeEditorFileDrop();
     this.editorInstance.contentDOM.addEventListener("beforeinput", event => {
       if (!this.isDeveloperLogEnabled("performance")) return;
       this.editorInputSequence += 1;
@@ -1657,6 +1908,168 @@ export class TypsastraWorkspaceController {
     );
   }
 
+  private initializePaneZoom(): void {
+    document.addEventListener("wheel", event => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const target = event.target as HTMLElement;
+      if (target.closest("#preview-container-wrapper, #editor-file-pdf-surface, #editor-file-image-surface")) return;
+      let kind: "editor" | "sidebar" | "log" | null = null;
+      if (target.closest("#code-render-pane")) kind = "editor";
+      else if (target.closest("#explorer-sidebar")) kind = "sidebar";
+      else if (target.closest("#log-console")) kind = "log";
+      if (!kind) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const direction = event.deltaY < 0 ? 1 : -1;
+      this.settingsController.update(settings => {
+        if (kind === "editor") {
+          settings.appearance.editorFontSize = Math.min(32, Math.max(10, settings.appearance.editorFontSize + direction));
+        } else if (kind === "sidebar") {
+          settings.appearance.sidebarZoomPercent = Math.min(200, Math.max(75, settings.appearance.sidebarZoomPercent + direction * 10));
+        } else {
+          settings.appearance.logZoomPercent = Math.min(200, Math.max(75, settings.appearance.logZoomPercent + direction * 10));
+        }
+      });
+    }, { capture: true, passive: false });
+  }
+
+  private initializeEditorFileViewer(): void {
+    document.getElementById("editor-file-zoom-in")?.addEventListener("click", () => this.editorFileZoomIn?.());
+    document.getElementById("editor-file-zoom-out")?.addEventListener("click", () => this.editorFileZoomOut?.());
+    document.getElementById("editor-file-zoom-fit")?.addEventListener("click", () => {
+      this.editorFileZoomFit?.();
+      this.settingsController.update(settings => {
+        settings.appearance.fileViewerZoomPercent = null;
+      });
+      const label = document.getElementById("editor-file-zoom-label");
+      if (label) label.textContent = "Fit";
+    });
+    document.getElementById("editor-file-open-external")?.addEventListener("click", () => {
+      if (this.activeFilePath) void this.openFileExternally(this.activeFilePath);
+    });
+  }
+
+  private prepareEditorFileViewer(path: string, kind: "pdf" | "image" | "placeholder"): void {
+    const toolbar = document.getElementById("editor-file-viewer-toolbar");
+    const pdfSurface = document.getElementById("editor-file-pdf-surface");
+    const imageSurface = document.getElementById("editor-file-image-surface");
+    const info = document.getElementById("image-viewer-info");
+    toolbar?.classList.toggle("hidden", kind === "placeholder");
+    pdfSurface?.classList.toggle("hidden", kind !== "pdf");
+    imageSurface?.classList.toggle("hidden", kind !== "image");
+    info?.classList.toggle("hidden", kind !== "placeholder");
+    const name = document.getElementById("editor-file-viewer-name");
+    if (name) {
+      name.textContent = fileNameFromPath(path);
+      name.title = path;
+    }
+    const page = document.getElementById("editor-file-viewer-page");
+    if (page) page.textContent = "";
+  }
+
+  private async renderEditorPdfViewer(path: string): Promise<void> {
+    this.prepareEditorFileViewer(path, "pdf");
+    this.editorFileZoomIn = () => this.editorFilePreviewFrame.zoomIn();
+    this.editorFileZoomOut = () => this.editorFilePreviewFrame.zoomOut();
+    this.editorFileZoomFit = () => this.editorFilePreviewFrame.zoomToFit();
+    await this.editorFilePreviewFrame.loadPdfPath(path, path, `editor-file:${path}`, "pdf");
+    const configured = this.settingsController.value.appearance.fileViewerZoomPercent;
+    if (configured === null) {
+      this.editorFilePreviewFrame.zoomToFit();
+      const label = document.getElementById("editor-file-zoom-label");
+      if (label) label.textContent = "Fit";
+      this.settingsController.update(settings => { settings.appearance.fileViewerZoomPercent = null; });
+    } else {
+      this.editorFilePreviewFrame.setZoomPercent(configured);
+    }
+    this.editorFilePreviewFrame.syncTheme();
+  }
+
+  private renderEditorImageViewer(src: string, path: string): void {
+    this.editorFilePreviewFrame.clear();
+    this.prepareEditorFileViewer(path, "image");
+    const container = document.getElementById("editor-file-image-surface");
+    const img = document.getElementById("image-viewer-img") as HTMLImageElement | null;
+    if (!container || !img) return;
+    let scale = 1;
+    let x = 0;
+    let y = 0;
+    let fit = this.settingsController.value.appearance.fileViewerZoomPercent === null;
+    const update = () => {
+      img.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+      const label = document.getElementById("editor-file-zoom-label");
+      if (label) label.textContent = fit ? "Fit" : `${Math.round(scale * 100)}%`;
+    };
+    const applyFit = () => {
+      if (!img.naturalWidth || !img.naturalHeight) return;
+      scale = Math.min(container.clientWidth / img.naturalWidth, container.clientHeight / img.naturalHeight, 1);
+      x = 0;
+      y = 0;
+      fit = true;
+      img.style.visibility = "visible";
+      update();
+    };
+    const applyScale = (next: number, clientX?: number, clientY?: number) => {
+      const bounded = Math.min(4, Math.max(0.1, next));
+      if (clientX !== undefined && clientY !== undefined) {
+        const rect = container.getBoundingClientRect();
+        const pointerX = clientX - rect.left - rect.width / 2;
+        const pointerY = clientY - rect.top - rect.height / 2;
+        x = pointerX - (pointerX - x) * bounded / scale;
+        y = pointerY - (pointerY - y) * bounded / scale;
+      }
+      scale = bounded;
+      fit = false;
+      update();
+      this.settingsController.update(settings => {
+        settings.appearance.fileViewerZoomPercent = Math.round(scale * 100);
+      });
+    };
+    this.editorFileZoomIn = () => applyScale(scale * 1.2);
+    this.editorFileZoomOut = () => applyScale(scale / 1.2);
+    this.editorFileZoomFit = applyFit;
+    img.onload = () => {
+      const configured = this.settingsController.value.appearance.fileViewerZoomPercent;
+      if (configured === null) applyFit();
+      else {
+        img.style.visibility = "visible";
+        applyScale(configured / 100);
+      }
+    };
+    img.onerror = () => {
+      this.prepareEditorFileViewer(path, "placeholder");
+      this.renderNonTextEditorPlaceholder(path, false, "Typsastra could not decode this image.");
+    };
+    img.src = src;
+    container.onwheel = event => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      applyScale(event.deltaY < 0 ? scale * 1.1 : scale / 1.1, event.clientX, event.clientY);
+    };
+    container.onpointerdown = event => {
+      if (event.button !== 0 && event.button !== 1) return;
+      const startX = event.clientX - x;
+      const startY = event.clientY - y;
+      img.style.cursor = "grabbing";
+      container.setPointerCapture(event.pointerId);
+      const move = (next: PointerEvent) => {
+        x = next.clientX - startX;
+        y = next.clientY - startY;
+        update();
+      };
+      const finish = () => {
+        container.removeEventListener("pointermove", move);
+        container.removeEventListener("pointerup", finish);
+        container.removeEventListener("pointercancel", finish);
+        img.style.cursor = "grab";
+      };
+      container.addEventListener("pointermove", move);
+      container.addEventListener("pointerup", finish);
+      container.addEventListener("pointercancel", finish);
+      event.preventDefault();
+    };
+  }
+
   private initExplorer() {
     this.explorer = new WorkspaceExplorer(
       document.getElementById("workspace-explorer-tree")!,
@@ -1664,7 +2077,8 @@ export class TypsastraWorkspaceController {
         void this.loadFile(path, options);
       },
       (path: string) => this.isPinnedMainFile(path),
-      document.getElementById("workspace-explorer-title")!
+      document.getElementById("workspace-explorer-title")!,
+      transfers => this.relocateWorkspacePaths(transfers)
     );
   }
 
@@ -1738,7 +2152,7 @@ export class TypsastraWorkspaceController {
     if (!tab.temporary) return;
     tab.temporary = false;
     this.renderEditorTabs();
-    this.saveWorkspaceState();
+    await this.saveWorkspaceState();
   }
 
   private getActiveTab(): EditorTab | null {
@@ -1944,12 +2358,7 @@ export class TypsastraWorkspaceController {
     if (
       startsTypingSequence
       && this.effectivePreviewRenderMode === "on-type"
-      && activeFileCanRenderPreview(
-        this.activeFilePath,
-        this.pinnedMainFilePath,
-        this.previewImported,
-        this.previewDisabled
-      )
+      && this.pathParticipatesInCurrentPreview(this.activeFilePath)
     ) {
       // Cancel stale scheduled or preparatory work once at the beginning of a
       // typing burst. Further keystrokes only replace the in-memory snapshot.
@@ -1992,16 +2401,126 @@ export class TypsastraWorkspaceController {
     this.handleContentMutation(currentText, previewDebounceElapsedMs);
   }
 
+  private async movedReferenceFileUpdates(
+    workspaceRoot: string,
+    moves: readonly WorkspacePathMove[],
+  ): Promise<MovedReferenceFileUpdate[]> {
+    const sourcePaths = await invoke<string[]>("list_workspace_typst_files", {
+      workspaceRootPath: workspaceRoot,
+    });
+    const updates: MovedReferenceFileUpdate[] = [];
+    let nextIndex = 0;
+    const worker = async (): Promise<void> => {
+      while (nextIndex < sourcePaths.length) {
+        const sourcePath = sourcePaths[nextIndex++];
+        const sourceText = await this.workspaceText(sourcePath);
+        const update = updateMovedPathReferences(
+          sourceText,
+          sourcePath,
+          workspaceRoot,
+          moves,
+        );
+        if (update.edits.length > 0) {
+          updates.push({
+            sourcePath,
+            text: update.text,
+            referenceCount: update.edits.length,
+          });
+        }
+      }
+    };
+    const workerCount = Math.min(8, Math.max(1, sourcePaths.length));
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return updates.sort((left, right) => left.sourcePath.localeCompare(right.sourcePath));
+  }
+  private async externalRenamePair(paths: readonly string[]): Promise<{ oldPath: string; newPath: string } | null> {
+    if (paths.length < 2) return null;
+    const candidates = await Promise.all(paths.map(async path => ({
+      path,
+      exists: await invoke<boolean>("workspace_path_exists", { path }).catch(() => false),
+    })));
+    const missing = candidates.filter(candidate => !candidate.exists);
+    const existing = candidates.filter(candidate => candidate.exists);
+    if (missing.length !== 1 || existing.length !== 1) return null;
+    return { oldPath: missing[0].path, newPath: existing[0].path };
+  }
+
+  private async offerExternalMovedReferenceUpdates(
+    workspaceRoot: string,
+    oldPath: string,
+    newPath: string,
+  ): Promise<void> {
+    try {
+      const updates = await this.movedReferenceFileUpdates(workspaceRoot, [{ oldPath, newPath }]);
+      if (updates.length === 0) return;
+      const referenceCount = updates.reduce(
+        (total, update) => total + update.referenceCount,
+        0,
+      );
+      const accepted = await confirm(
+        `Typsastra found ${referenceCount} reference${referenceCount === 1 ? "" : "s"} in ${updates.length} Typst file${updates.length === 1 ? "" : "s"} after an item moved inside the project. Update ${referenceCount === 1 ? "it" : "them"} to follow the moved item?\n\nAffected files will be saved.`,
+        {
+          title: "Update Moved File References?",
+          kind: "info",
+          okLabel: "Update References",
+          cancelLabel: "Keep Existing Paths",
+        },
+      );
+      if (!accepted) return;
+      for (const update of updates) {
+        await this.writeWorkspaceText(update.sourcePath, update.text);
+      }
+      this.workspacePathCompletionCache = null;
+      this.setLspStatus({
+        kind: "preview-ready",
+        message: `Updated ${referenceCount} moved-file reference${referenceCount === 1 ? "" : "s"}`,
+      });
+    } catch (error) {
+      await message(
+        `The project item moved, but Typsastra could not finish checking or updating its references.\n\n${String(error)}`,
+        { title: "Reference Update Incomplete", kind: "warning" },
+      ).catch(() => {});
+    }
+  }
+
+
+
+
   private async renameWorkspacePath(oldPath: string, newPath: string): Promise<void> {
+    return this.relocateWorkspacePaths([{ sourcePath: oldPath, destinationPath: newPath }]);
+  }
+
+  private async relocateWorkspacePaths(
+    transfers: readonly { sourcePath: string; destinationPath: string }[],
+  ): Promise<void> {
     const workspaceRoot = this.workspaceRootPath;
+    if (!workspaceRoot || transfers.length === 0) return;
+    const moves: WorkspacePathMove[] = transfers
+      .map(transfer => ({ oldPath: transfer.sourcePath, newPath: transfer.destinationPath }))
+      .sort((left, right) => right.oldPath.length - left.oldPath.length);
+    const remapMovedPath = (path: string): string => {
+      const move = moves.find(candidate => relativeFilePath(candidate.oldPath, path) !== null);
+      return move ? remapFilePath(path, move.oldPath, move.newPath) : path;
+    };
+    const selectedBeforeMove = this.explorer.selectedEntries();
+    const expandedBeforeMove = this.explorer.expandedDirectoryPaths();
     if (workspaceRoot) this.workspaceWatcher.stop();
 
+    let referenceUpdates: MovedReferenceFileUpdate[] = [];
+    let referenceScanError: unknown = null;
     try {
-      await invoke("rename_workspace_file", { oldPath, newPath });
+      if (workspaceRoot) {
+        try {
+          referenceUpdates = await this.movedReferenceFileUpdates(workspaceRoot, moves);
+        } catch (error) {
+          referenceScanError = error;
+        }
+      }
+      await invoke("move_workspace_entries", { workspaceRootPath: workspaceRoot, transfers });
 
       const renamedTabs: Array<{ oldPath: string; tab: EditorTab }> = [];
       for (const tab of this.openTabs) {
-        const renamedPath = remapFilePath(tab.path, oldPath, newPath);
+        const renamedPath = remapMovedPath(tab.path);
         if (renamedPath === tab.path) continue;
 
         renamedTabs.push({ oldPath: tab.path, tab });
@@ -2014,13 +2533,13 @@ export class TypsastraWorkspaceController {
       }
 
       this.activeFilePath = this.activeFilePath
-        ? remapFilePath(this.activeFilePath, oldPath, newPath)
+        ? remapMovedPath(this.activeFilePath)
         : null;
       this.pinnedMainFilePath = this.pinnedMainFilePath
-        ? remapFilePath(this.pinnedMainFilePath, oldPath, newPath)
+        ? remapMovedPath(this.pinnedMainFilePath)
         : null;
       this.pendingLspSyncPath = this.pendingLspSyncPath
-        ? remapFilePath(this.pendingLspSyncPath, oldPath, newPath)
+        ? remapMovedPath(this.pendingLspSyncPath)
         : null;
 
       // Preview roots and task identities include the source path. Keeping any
@@ -2070,10 +2589,10 @@ export class TypsastraWorkspaceController {
             await this.lspClient.openTextDocument(newUri, renamed.tab.content, renamed.tab.version);
             this.openedDocumentUris.add(newUri);
           }
-          await this.lspClient.notifyWorkspaceFilesChanged([
-            { uri: filePathToUri(oldPath), type: 3 },
-            { uri: filePathToUri(newPath), type: 1 }
-          ]);
+          await this.lspClient.notifyWorkspaceFilesChanged(moves.flatMap(move => [
+            { uri: filePathToUri(move.oldPath), type: 3 as const },
+            { uri: filePathToUri(move.newPath), type: 1 as const }
+          ]));
         } catch (error) {
           this.appendDeveloperLog({
             kind: "warning",
@@ -2083,12 +2602,68 @@ export class TypsastraWorkspaceController {
         }
       }
 
+      if (referenceScanError !== null) {
+        await message(
+          `The item was moved, but Typsastra could not check the project for references.\n\n${String(referenceScanError)}`,
+          { title: "Reference Check Failed", kind: "warning" },
+        ).catch(() => {});
+      } else if (referenceUpdates.length > 0) {
+        const referenceCount = referenceUpdates.reduce(
+          (total, update) => total + update.referenceCount,
+          0,
+        );
+        const accepted = await confirm(
+          `Typsastra found ${referenceCount} reference${referenceCount === 1 ? "" : "s"} in ${referenceUpdates.length} Typst file${referenceUpdates.length === 1 ? "" : "s"}. Update ${referenceCount === 1 ? "it" : "them"} to follow the moved item?\n\nAffected files will be saved.`,
+          {
+            title: "Update Moved File References?",
+            kind: "info",
+            okLabel: "Update References",
+            cancelLabel: "Keep Existing Paths",
+          },
+        );
+        if (accepted) {
+          try {
+            for (const update of referenceUpdates) {
+              const sourcePath = remapMovedPath(update.sourcePath);
+              await this.writeWorkspaceText(sourcePath, update.text);
+            }
+            this.workspacePathCompletionCache = null;
+            this.setLspStatus({
+              kind: "preview-ready",
+              message: `Updated ${referenceCount} moved-file reference${referenceCount === 1 ? "" : "s"}`,
+            });
+          } catch (error) {
+            await message(
+              `The item was moved, but one or more references could not be updated.\n\n${String(error)}`,
+              { title: "Reference Update Incomplete", kind: "warning" },
+            ).catch(() => {});
+          }
+        }
+      }
+
+
+      await this.explorer.loadWorkspace(
+        workspaceRoot,
+        expandedBeforeMove.map(remapMovedPath),
+      );
+      selectedBeforeMove.forEach((entry, index) => {
+        this.explorer.selectPath(remapMovedPath(entry.path), index > 0);
+      });
       await this.prepareRenderProjectIfNeeded();
       await this.refreshActivePreviewRoot(true);
     } finally {
       if (workspaceRoot && this.workspaceRootPath === workspaceRoot) {
         await this.workspaceWatcher.start(workspaceRoot);
       }
+    }
+  }
+
+  private async closeTabsUnderWorkspacePath(path: string): Promise<void> {
+    const matching = this.openTabs
+      .filter(tab => relativeFilePath(path, tab.path) !== null)
+      .map(tab => tab.path);
+    for (const tabPath of matching) {
+      await this.closeEditorTab(tabPath, true);
     }
   }
 
@@ -2163,7 +2738,7 @@ export class TypsastraWorkspaceController {
 
     this.renderEditorTabs();
     this.updateWorkspaceViewportVisibility();
-    this.saveWorkspaceState();
+    await this.saveWorkspaceState();
   }
 
   private async largeFileNoticeForTab(tab: EditorTab) {
@@ -2200,7 +2775,8 @@ export class TypsastraWorkspaceController {
         filePath: tab.path,
         workspaceRootPath: this.workspaceRootPath,
         fileContents: tab.contentLoaded ? tab.content : null,
-        pinnedMainPath: this.pinnedMainFilePath
+        pinnedMainPath: this.pinnedMainFilePath,
+        alwaysUsePinnedMain: this.settingsController.value.editor.keepMainFilePreview
       });
     } catch {
       return null;
@@ -2642,6 +3218,29 @@ export class TypsastraWorkspaceController {
     return isPlainText;
   }
 
+  private retainedMainPreviewSession(path: string): PreviewSessionState | null {
+    if (!this.settingsController.value.editor.keepMainFilePreview) return null;
+    const root = this.currentPreviewCompilationRoot();
+    if (!root || filePathKey(path) === filePathKey(root)) return null;
+
+    const pinned = this.pinnedMainFilePath;
+    if (pinned) {
+      const mainTab = this.openTabs.find(tab => filePathKey(tab.path) === filePathKey(pinned));
+      if (mainTab?.previewRootPath) {
+        return {
+          previewRootPath: mainTab.previewRootPath,
+          previewMainPath: mainTab.previewMainPath,
+          previewTaskId: mainTab.previewTaskId,
+          previewSessionKey: mainTab.previewSessionKey,
+          previewImported: mainTab.previewImported,
+          previewStandalone: mainTab.previewStandalone,
+          previewDisabled: mainTab.previewDisabled,
+        };
+      }
+    }
+    return this.pathParticipatesInCurrentPreview(path) ? this.capturePreviewSession() : null;
+  }
+
   private async activateEditorTab(path: string, persistCurrent = true, options: ActivateEditorTabOptions = {}) {
     this.explorer.setActiveFile(path);
     if (this.workspaceRootPath) {
@@ -2656,7 +3255,7 @@ export class TypsastraWorkspaceController {
       // Restored unknown tabs begin as lightweight external-file descriptors.
       // Once their content is identified as text, defer loading it through the
       // same large-file guard and text-editor path as a known text extension.
-      if (!tab.content && !tab.savedContent) tab.contentLoaded = false;
+      if (tab.savedContent !== null && !tab.content && !tab.savedContent) tab.contentLoaded = false;
     }
     if (tab && !tab.contentLoaded) {
       const notice = await this.largeFileNoticeForTab(tab);
@@ -2706,6 +3305,8 @@ export class TypsastraWorkspaceController {
 
     path = tab.path;
     const isTypstDocument = isTypstDocumentPath(path);
+    const retainedMainPreview = !isTypstDocument ? this.retainedMainPreviewSession(path) : null;
+    const previewToolbarPath = retainedMainPreview ? this.pinnedMainFilePath : path;
     this.acceptedTypographyScales.set(
       filePathKey(path),
       this.documentTypographyFromText(tab.content)?.fonts.map(font => ({ ...font })) ?? []
@@ -2719,17 +3320,24 @@ export class TypsastraWorkspaceController {
     try {
       const codeRenderPane = document.getElementById("code-render-pane");
       const imageViewerPane = document.getElementById("image-viewer-pane");
-      const imageViewerImg = document.getElementById("image-viewer-img") as HTMLImageElement;
-
       const unsupportedFile = !this.isInternallySupportedPath(path);
       const isPdf = fileExtension(path) === "pdf";
       if (unsupportedFile || isBinaryImagePath(path) || isPdf) {
         codeRenderPane?.classList.add("hidden");
         imageViewerPane?.classList.remove("hidden");
-        if (imageViewerImg) imageViewerImg.style.display = "none"; // Hide image element in editor
-        
-        this.renderNonTextEditorPlaceholder(path, unsupportedFile);
         document.getElementById("wysiwym-editor-pane")?.classList.add("hidden");
+        if (unsupportedFile) {
+          this.editorFilePreviewFrame.clear();
+          this.prepareEditorFileViewer(path, "placeholder");
+          this.renderNonTextEditorPlaceholder(path, true);
+        } else if (isBinaryImagePath(path)) {
+          this.renderEditorImageViewer(tab.content, path);
+        } else {
+          void this.renderEditorPdfViewer(path).catch(error => {
+            this.prepareEditorFileViewer(path, "placeholder");
+            this.renderNonTextEditorPlaceholder(path, false, `Typsastra could not render this PDF: ${String(error)}`);
+          });
+        }
 
         this.imageZoomIn = null;
         this.imageZoomOut = null;
@@ -2740,18 +3348,12 @@ export class TypsastraWorkspaceController {
         this.activateSpellcheckDocument(null);
         this.documentOutlineController.clear();
         if (!options.skipPreviewActivation) {
-          this.updatePreviewActionsToolbar(path);
-          if (isBinaryImagePath(path)) {
-            this.renderInteractiveImageViewer(tab.content);
-          } else if (isPdf) {
-            void this.loadPdfPath(path, path);
-          } else {
-            this.previewFrame.setMessage(
-              `<div class="preview-disabled-placeholder">` +
-              `<div class="preview-disabled-title">Preview Unavailable</div>` +
-              `<div class="preview-disabled-msg">Open this file with its system application to view it.</div>` +
-              `</div>`
-            );
+          this.updatePreviewActionsToolbar(this.pinnedMainFilePath);
+          if (retainedMainPreview) {
+            this.applyPreviewSessionToTab(tab, retainedMainPreview);
+            if (retainedMainPreview.previewSessionKey) {
+              this.previewFrame.activateSession(retainedMainPreview.previewSessionKey);
+            }
           }
         }
         this.editorToolbarController.setDisabled(true);
@@ -2771,10 +3373,16 @@ export class TypsastraWorkspaceController {
         this.imageZoomPercent = null;
         this.imageIsFit = null;
 
-        this.updatePreviewActionsToolbar(path);
+        this.updatePreviewActionsToolbar(previewToolbarPath);
+        if (retainedMainPreview) {
+          this.applyPreviewSessionToTab(tab, retainedMainPreview);
+          if (retainedMainPreview.previewSessionKey) {
+            this.previewFrame.activateSession(retainedMainPreview.previewSessionKey);
+          }
+        }
         codeRenderPane?.classList.remove("hidden");
         imageViewerPane?.classList.add("hidden");
-        if (imageViewerImg) imageViewerImg.style.display = "block"; // Reset styling
+        this.editorFilePreviewFrame.clear();
         if (this.activeMode === "WYSIWYM") {
           document.getElementById("wysiwym-editor-pane")?.classList.remove("hidden");
         }
@@ -2784,13 +3392,13 @@ export class TypsastraWorkspaceController {
           this.editorToolbarController.setDisabled(false);
         } else {
           this.editorToolbarController.setDisabled(true);
-          if (ext === "svg") {
+          if (!retainedMainPreview && ext === "svg") {
             this.previewFrame.setMessageOverlay(
               `<div style="display:flex;align-items:center;justify-content:center;height:100%;width:100%;background:var(--ui-bg);box-sizing:border-box;padding:20px;overflow:auto;">` +
               tab.content +
               `</div>`
             );
-          } else {
+          } else if (!retainedMainPreview) {
             this.previewFrame.setMessageOverlay(
               `<div class="preview-disabled-placeholder">` +
               `<div class="preview-disabled-icon">🚫</div>` +
@@ -2857,14 +3465,13 @@ export class TypsastraWorkspaceController {
     } else if (!isTypstDocument) {
       // Non-Typst text files remain editor-only. Their preview placeholder was
       // selected above and they must never be resolved as compiler roots.
-    } else if (!this.pinnedMainFilePath) {
-      this.previewFrame.setMessage(this.noMainFileMessage());
     } else {
       previewTarget = await invoke<PreviewTarget>("resolve_preview_main", {
         filePath: path,
         workspaceRootPath: this.workspaceRootPath,
         fileContents: tab.content,
-        pinnedMainPath: this.pinnedMainFilePath
+        pinnedMainPath: this.pinnedMainFilePath,
+        alwaysUsePinnedMain: this.settingsController.value.editor.keepMainFilePreview
       });
       if (previewTarget.disabled) {
         this.applyPreviewTargetToTab(tab, previewTarget);
@@ -2926,8 +3533,6 @@ export class TypsastraWorkspaceController {
         // The source editor remains active while preview startup waits for consent.
       } else if (options.preservePreviewSession) {
         // preserve
-      } else if (!this.pinnedMainFilePath) {
-        this.previewFrame.setMessage(this.noMainFileMessage());
       } else if (previewTarget?.disabled) {
         this.previewFrame.setMessage(this.disabledPreviewMessage());
       } else if (this.previewRootPath) {
@@ -3425,10 +4030,11 @@ export class TypsastraWorkspaceController {
         this.externalConflictPaths.delete(filePathKey(activeTab.path));
         this.renderEditorTabs();
       }
+      await this.persistWorkspaceRecovery();
       this.setLspStatus({ kind: "preview-ready", message: "File saved" });
       if (
         savedChangedRevision
-        && participatesInPreviewCompilation(this.activeFilePath, this.pinnedMainFilePath, this.previewImported)
+        && this.pathParticipatesInCurrentPreview(this.activeFilePath)
         && !this.previewDisabled
       ) {
         void this.renderPdfPreview(content);
@@ -3556,6 +4162,7 @@ export class TypsastraWorkspaceController {
       }
       this.renderEditorTabs();
     }
+    await this.persistWorkspaceRecovery();
     if (this.lspReady && this.lspClient) {
       const lspRes = await this.getLspUriAndContent(path, content);
       if (lspRes) {
@@ -3904,6 +4511,14 @@ export class TypsastraWorkspaceController {
       ? researchDocumentIdentity(this.workspaceRootPath ?? target.rootPath, target.mainPath, tab.path)
       : null;
     const identity = target.rootPath ? previewSessionIdentity(target.rootPath, style, document ?? undefined) : null;
+    const targetRootKey = target.rootPath
+      ? filePathKey(this.mapToOriginalPath(target.rootPath))
+      : null;
+    if (this.previewDependencyRootKey && this.previewDependencyRootKey !== targetRootKey) {
+      this.previewDependencyRootKey = null;
+      this.previewDependencyPathKeys.clear();
+      this.previewDependencyManifestComplete = null;
+    }
     tab.previewRootPath = target.rootPath;
     tab.previewMainPath = target.mainPath;
     tab.previewTaskId = identity?.taskId ?? null;
@@ -4092,12 +4707,7 @@ export class TypsastraWorkspaceController {
       this.appendDeveloperLog({ kind: "info", source: "preview scheduler", message: "Render skipped: preview is disabled." });
       return;
     }
-    if (!activeFileCanRenderPreview(
-      this.activeFilePath,
-      this.pinnedMainFilePath,
-      this.previewImported,
-      this.previewDisabled
-    )) {
+    if (!this.pathParticipatesInCurrentPreview(this.activeFilePath)) {
       this.appendDeveloperLog({
         kind: "info",
         source: "preview scheduler",
@@ -4439,12 +5049,7 @@ export class TypsastraWorkspaceController {
         this.effectivePreviewRenderMode === "on-type"
         && generationActivePath
         && filePathKey(this.activeFilePath ?? "") === filePathKey(generationActivePath)
-        && activeFileCanRenderPreview(
-          this.activeFilePath,
-          this.pinnedMainFilePath,
-          this.previewImported,
-          this.previewDisabled
-        )
+        && this.pathParticipatesInCurrentPreview(this.activeFilePath)
       ) {
         const latestContents = this.editorInstance.state.doc.toString();
         if (latestContents !== contents) {
@@ -4511,7 +5116,6 @@ export class TypsastraWorkspaceController {
     if (!cacheRoot) return null;
     this.pdfPreviewGeneratedFiles.clear();
     const originalRootPath = this.mapToOriginalPath(rootPath);
-    const originalActivePath = this.mapToOriginalPath(this.activeFilePath);
     const options = {
       enableKhmerZws: this.settingsController.value.preview.khmerRenderPreparation,
       projectRoot: this.workspaceRootPath,
@@ -4520,65 +5124,32 @@ export class TypsastraWorkspaceController {
       generateSourceMap: true,
       previewContentMode: contentMode
     };
+    const overlays = useEditorOverlays ? this.editorRenderOverlays(contents) : [];
     const projectPreparationStartedAt = performance.now();
-    const result = await invoke<RenderPreparationResult>("prepare_render_project", { options });
+    const result = await invoke<RenderPreparationResult>("prepare_render_project", { options, overlays });
     const projectPreparationMs = performance.now() - projectPreparationStartedAt;
     this.ensurePreviewPreparationCurrent(preparationRevision);
+    this.installPreviewDependencyManifest(
+      originalRootPath,
+      result.dependencyFiles,
+      result.dependencyManifestComplete
+    );
     const draftAssets = new Map(result.draftAssets.map(asset => [asset.id, asset]));
     const draftDiagnostics = [...result.draftDiagnostics];
-    const draftReachableFileKeys = new Set(
-      result.draftReachableFiles.map(path => filePathKey(this.mapToOriginalPath(path)))
-    );
     let draftOverlayCacheHits = 0;
-    let draftOverlayPreparations = 0;
-    let overlayPreparationMs = 0;
-    const tabsToOverlay = useEditorOverlays
-      ? this.openTabs
-        .filter(tab => tab.contentLoaded)
-        .filter(tab => tab.path.toLowerCase().endsWith(".typ"))
-        .filter(tab => this.workspaceRootPath && relativeFilePath(this.workspaceRootPath, this.mapToOriginalPath(tab.path)) !== null)
-        .filter(tab => draftReachableFileKeys.has(filePathKey(this.mapToOriginalPath(tab.path))))
-      : [];
-    const overlaid = new Set<string>();
-    for (const tab of tabsToOverlay) {
-      const originalTabPath = this.mapToOriginalPath(tab.path);
-      overlaid.add(filePathKey(originalTabPath));
-      const sourceCode = filePathKey(originalTabPath) === filePathKey(originalActivePath)
-        ? contents
-        : tab.content;
-      const overlayStartedAt = performance.now();
-      const generated = await invoke<RenderPreparationFileResult>("prepare_render_file", {
-        options,
-        filePath: originalTabPath,
-        sourceCode
-      });
-      overlayPreparationMs += performance.now() - overlayStartedAt;
-      this.ensurePreviewPreparationCurrent(preparationRevision);
-      this.pdfPreviewGeneratedFiles.set(filePathKey(originalTabPath), generated);
-      draftOverlayPreparations += 1;
-      if (generated.draftCacheHit) draftOverlayCacheHits += 1;
-      for (const asset of generated.draftAssets) draftAssets.set(asset.id, asset);
-      draftDiagnostics.push(...generated.draftDiagnostics);
+    for (const prepared of result.preparedOverlays) {
+      const generated: RenderPreparationFileResult = {
+        generatedPath: prepared.generatedPath,
+        preparedText: prepared.preparedText,
+        draftAssets: [],
+        draftDiagnostics: [],
+        draftCacheHit: prepared.draftCacheHit
+      };
+      this.pdfPreviewGeneratedFiles.set(filePathKey(prepared.sourcePath), generated);
+      if (prepared.draftCacheHit) draftOverlayCacheHits += 1;
     }
-    if (
-      useEditorOverlays
-      && draftReachableFileKeys.has(filePathKey(originalActivePath))
-      && !overlaid.has(filePathKey(originalActivePath))
-    ) {
-      const overlayStartedAt = performance.now();
-      const activeGenerated = await invoke<RenderPreparationFileResult>("prepare_render_file", {
-        options,
-        filePath: originalActivePath,
-        sourceCode: contents
-      });
-      overlayPreparationMs += performance.now() - overlayStartedAt;
-      this.ensurePreviewPreparationCurrent(preparationRevision);
-      this.pdfPreviewGeneratedFiles.set(filePathKey(originalActivePath), activeGenerated);
-      draftOverlayPreparations += 1;
-      if (activeGenerated.draftCacheHit) draftOverlayCacheHits += 1;
-      for (const asset of activeGenerated.draftAssets) draftAssets.set(asset.id, asset);
-      draftDiagnostics.push(...activeGenerated.draftDiagnostics);
-    }
+    const draftOverlayPreparations = result.preparedOverlays.length;
+    const overlayPreparationMs = 0;
     this.appendDeveloperLog({
       kind: "info",
       source: "preview scheduler",
@@ -4798,12 +5369,7 @@ export class TypsastraWorkspaceController {
       this.appendDeveloperLog({ kind: "info", source: "preview scheduler", message: "On-type schedule skipped: preview is disabled." });
       return;
     }
-    if (!activeFileCanRenderPreview(
-      this.activeFilePath,
-      this.pinnedMainFilePath,
-      this.previewImported,
-      this.previewDisabled
-    )) {
+    if (!this.pathParticipatesInCurrentPreview(this.activeFilePath)) {
       this.appendDeveloperLog({
         kind: "info",
         source: "preview scheduler",
@@ -4821,42 +5387,57 @@ export class TypsastraWorkspaceController {
     }
     const scheduleGeneration = ++this.pdfPreviewScheduleGeneration;
     const scheduledPath = this.activeFilePath;
+    const now = Date.now();
+    const effectiveDelayMs = onTypePreviewDelayMs({
+      debounceDelayMs: delayMs,
+      nowMs: now,
+      lastPreviewStartedAtMs: this.lastOnTypePreviewStartedAt,
+      rateLimitSeconds: this.settingsController.value.preview.onTypeRateLimitSeconds,
+    });
+    const scheduledAt = now + effectiveDelayMs;
     this.appendDeveloperLog({
       kind: "info",
       source: "preview scheduler",
-      message: `On-type timer ${scheduleGeneration} scheduled: active=${scheduledPath ?? "none"}; sourceUtf16=${contents.length}; delay=${delayMs}ms.`
+      message: "On-type timer " + scheduleGeneration
+        + " scheduled: active=" + (scheduledPath ?? "none")
+        + "; sourceUtf16=" + contents.length
+        + "; delay=" + effectiveDelayMs + "ms"
+        + "; rateLimit=" + this.settingsController.value.preview.onTypeRateLimitSeconds + "s."
     });
-    this.pdfPreviewTimer = window.setTimeout(() => {
+    const fire = () => {
+      const remainingMs = scheduledAt - Date.now();
+      if (remainingMs > 0) {
+        this.pdfPreviewTimer = window.setTimeout(fire, browserTimerDelayMs(remainingMs));
+        return;
+      }
       this.pdfPreviewTimer = null;
       if (
         this.activeFilePath
         && filePathKey(this.activeFilePath) === filePathKey(scheduledPath ?? "")
-        && activeFileCanRenderPreview(
-          this.activeFilePath,
-          this.pinnedMainFilePath,
-          this.previewImported,
-          this.previewDisabled
-        )
+        && this.pathParticipatesInCurrentPreview(this.activeFilePath)
       ) {
-        this.appendDeveloperLog({ kind: "info", source: "preview scheduler", message: `On-type timer ${scheduleGeneration} fired.` });
+        this.appendDeveloperLog({
+          kind: "info",
+          source: "preview scheduler",
+          message: "On-type timer " + scheduleGeneration + " fired."
+        });
+        this.lastOnTypePreviewStartedAt = Date.now();
         void this.renderPdfPreview(contents);
       } else {
         this.appendDeveloperLog({
           kind: "info",
           source: "preview scheduler",
-          message: `On-type timer ${scheduleGeneration} discarded: active path changed from ${scheduledPath ?? "none"} to ${this.activeFilePath ?? "none"}.`
+          message: "On-type timer " + scheduleGeneration
+            + " discarded: active path changed from " + (scheduledPath ?? "none")
+            + " to " + (this.activeFilePath ?? "none") + "."
         });
       }
-    }, delayMs);
+    };
+    this.pdfPreviewTimer = window.setTimeout(fire, browserTimerDelayMs(effectiveDelayMs));
   }
 
   private handleContentMutation(rawText: string, previewDebounceElapsedMs = 0) {
-    const canRenderPreview = activeFileCanRenderPreview(
-      this.activeFilePath,
-      this.pinnedMainFilePath,
-      this.previewImported,
-      this.previewDisabled
-    );
+    const canRenderPreview = this.pathParticipatesInCurrentPreview(this.activeFilePath);
     if (!this.isLoadingFile && canRenderPreview) {
       this.pdfPreparationRevision += 1;
       if (this.effectivePreviewRenderMode === "on-type") {
@@ -4907,7 +5488,6 @@ export class TypsastraWorkspaceController {
     if (
       !this.isLoadingFile
       && this.activeFilePath
-      && this.activeFilePath.toLowerCase().endsWith(".typ")
       && canRenderPreview
       && this.effectivePreviewRenderMode === "on-type"
       && !this.previewDisabled
@@ -4916,11 +5496,7 @@ export class TypsastraWorkspaceController {
         0,
         this.settingsController.value.preview.syncDebounceMs - previewDebounceElapsedMs
       );
-      if (remainingPreviewDebounceMs === 0) {
-        void this.renderPdfPreview(rawText);
-      } else {
-        this.schedulePdfPreview(rawText, remainingPreviewDebounceMs);
-      }
+      this.schedulePdfPreview(rawText, remainingPreviewDebounceMs);
     }
   }
 
@@ -4972,7 +5548,7 @@ export class TypsastraWorkspaceController {
       this.acceptedTypographyScales.set(documentKey, config.fonts.map(font => ({ ...font })));
       return;
     }
-    if (!participatesInPreviewCompilation(this.activeFilePath, this.pinnedMainFilePath, this.previewImported)) {
+    if (!this.pathParticipatesInCurrentPreview(this.activeFilePath)) {
       this.appendDeveloperLog({
         kind: "info",
         source: "preview scheduler",
@@ -5139,7 +5715,8 @@ export class TypsastraWorkspaceController {
         filePath: path,
         workspaceRootPath: this.workspaceRootPath,
         fileContents: text,
-        pinnedMainPath: this.pinnedMainFilePath
+        pinnedMainPath: this.pinnedMainFilePath,
+        alwaysUsePinnedMain: this.settingsController.value.editor.keepMainFilePreview
       });
       target = await this.prepareTemplateAwarePreview(target, path, text);
     }
@@ -6443,12 +7020,7 @@ export class TypsastraWorkspaceController {
       if (
         latestContents !== this.lastFailedPreviewContents
         && latestContents !== this.lastPreviewRecoveryRequestedContents
-        && activeFileCanRenderPreview(
-          this.activeFilePath,
-          this.pinnedMainFilePath,
-          this.previewImported,
-          this.previewDisabled
-        )
+        && this.pathParticipatesInCurrentPreview(this.activeFilePath)
       ) {
         // A compiler failure can settle at the same time as the editor's valid
         // revision. Treat the accepted diagnostic-clear event as a recovery
@@ -6934,8 +7506,49 @@ export class TypsastraWorkspaceController {
       }
     };
     this.workspaceMetadata = metadata;
-    return this.workspaceStateStore.save(this.workspaceRootPath, metadata).catch(error => {
+    const metadataSave = this.workspaceStateStore.save(this.workspaceRootPath, metadata).catch(error => {
       this.appendDeveloperLog({ kind: "error", source: "workspace", message: `Failed to save workspace state: ${String(error)}` });
+    });
+    return Promise.all([metadataSave, this.persistWorkspaceRecovery()]).then(() => {});
+  }
+
+  private persistWorkspaceRecovery(activeDocument?: Text): Promise<void> {
+    const workspacePath = this.workspaceRootPath;
+    if (!workspacePath) return Promise.resolve();
+    const activePathKey = this.activeFilePath ? filePathKey(this.activeFilePath) : null;
+    const activeSelection = this.editorInstance?.state.selection.main;
+    const tabs = this.openTabs.flatMap(tab => {
+      if (
+        !tab.contentLoaded
+        || !this.isInternallySupportedPath(tab.path)
+        || isBinaryImagePath(tab.path)
+        || fileExtension(tab.path) === "pdf"
+      ) return [];
+      const path = relativeFilePath(workspacePath, tab.path)?.replace(/\\/g, "/");
+      if (!path) return [];
+      const active = activePathKey !== null && filePathKey(tab.path) === activePathKey;
+      const content = active
+        ? (activeDocument ?? this.editorInstance.state.doc).toString()
+        : tab.content;
+      if (content === tab.savedContent) return [];
+      return [{
+        path,
+        content,
+        selectionAnchor: active && activeSelection ? activeSelection.anchor : tab.selectionAnchor,
+        selectionHead: active && activeSelection ? activeSelection.head : tab.selectionHead,
+      }];
+    });
+    const recovery: WorkspaceRecovery = {
+      schemaVersion: 1,
+      updatedAtMs: Date.now(),
+      tabs,
+    };
+    return this.workspaceRecoveryStore.save(workspacePath, recovery).catch(error => {
+      this.appendDeveloperLog({
+        kind: "error",
+        source: "workspace",
+        message: `Failed to save crash recovery data: ${String(error)}`,
+      });
     });
   }
 
@@ -6981,6 +7594,15 @@ export class TypsastraWorkspaceController {
     try {
       const state = metadata.workspace;
       const project = metadata.project;
+      const recovery = await this.workspaceRecoveryStore.load(workspacePath).catch(error => {
+        this.appendDeveloperLog({
+          kind: "warning",
+          source: "workspace",
+          message: `Crash recovery data could not be loaded: ${String(error)}`,
+        });
+        return { schemaVersion: 1, updatedAtMs: 0, tabs: [] } as WorkspaceRecovery;
+      });
+      const recoveryByPath = new Map(recovery.tabs.map(tab => [tab.path, tab]));
       this.previewScrollTop = state.previewScrollTop;
       this.previewFrame.restoreWorkspaceScrollPosition(state.previewScrollTop);
       const inputContainer = document.getElementById("input-container-wrapper");
@@ -7004,19 +7626,52 @@ export class TypsastraWorkspaceController {
       const explorerSidebar = document.getElementById("explorer-sidebar");
       if (explorerSidebar) explorerSidebar.style.width = `${state.layout.explorerSidebarWidthPx}px`;
 
-      const restoredTabs = await Promise.all(state.openTabs.map(async tabInfo => ({
+      const tabInfos = [...state.openTabs];
+      for (const recovered of recovery.tabs) {
+        if (!tabInfos.some(tab => tab.path === recovered.path)) {
+          tabInfos.push({
+            path: recovered.path,
+            selectionAnchor: recovered.selectionAnchor,
+            selectionHead: recovered.selectionHead,
+            foldState: null,
+            foldRanges: null,
+          });
+        }
+      }
+      const restoredTabs = await Promise.all(tabInfos.map(async tabInfo => ({
         tabInfo,
-        path: await this.absoluteWorkspacePath(workspacePath, tabInfo.path)
+        path: await this.absoluteWorkspacePath(workspacePath, tabInfo.path),
+        recovery: recoveryByPath.get(tabInfo.path),
       })));
-      for (const { tabInfo, path } of restoredTabs) {
+      let recoveredDirtyTabs = 0;
+      for (const { tabInfo, path, recovery: recovered } of restoredTabs) {
         if (!path) continue;
         if (this.openTabs.some(tab => filePathKey(tab.path) === filePathKey(path))) continue;
+        let content = "";
+        let savedContent: string | null = "";
+        let contentLoaded = !isSupportedInAppPath(path);
+        if (recovered) {
+          content = recovered.content;
+          contentLoaded = true;
+          const exists = await invoke<boolean>("workspace_path_exists", { path });
+          savedContent = exists
+            ? await invoke<string>("read_workspace_file", { path })
+                .then(normalizeEditorText)
+                .catch(() => null)
+            : null;
+          if (!isSupportedInAppPath(path)) {
+            const key = filePathKey(path);
+            this.classifiedUnknownPaths.add(key);
+            this.detectedPlainTextPaths.add(key);
+          }
+          recoveredDirtyTabs += savedContent === null || content !== savedContent ? 1 : 0;
+        }
         this.openTabs.push({
           path,
-          content: "",
-          savedContent: "",
-          contentLoaded: !isSupportedInAppPath(path),
-          isDirty: false,
+          content,
+          savedContent,
+          contentLoaded,
+          isDirty: savedContent === null || content !== savedContent,
           previewRootPath: null,
           previewMainPath: null,
           previewTaskId: null,
@@ -7026,8 +7681,8 @@ export class TypsastraWorkspaceController {
           previewDisabled: false,
           version: 1,
           latestVersion: 1,
-          selectionAnchor: tabInfo.selectionAnchor || 0,
-          selectionHead: tabInfo.selectionHead || 0,
+          selectionAnchor: recovered?.selectionAnchor ?? tabInfo.selectionAnchor ?? 0,
+          selectionHead: recovered?.selectionHead ?? tabInfo.selectionHead ?? 0,
           scrollTop: tabInfo.scrollTop,
           scrollLeft: tabInfo.scrollLeft,
           // Bounds are validated after this tab is hydrated.
@@ -7038,6 +7693,18 @@ export class TypsastraWorkspaceController {
         });
       }
       this.renderEditorTabs();
+
+      if (recoveredDirtyTabs > 0) {
+        this.appendDeveloperLog({
+          kind: "warning",
+          source: "workspace",
+          message: `Recovered unsaved edits in ${recoveredDirtyTabs} file${recoveredDirtyTabs === 1 ? "" : "s"} after the previous session ended.`,
+        });
+        this.setLspStatus({
+          kind: "sync-pending",
+          message: `Recovered unsaved edits in ${recoveredDirtyTabs} file${recoveredDirtyTabs === 1 ? "" : "s"}`,
+        });
+      }
 
       if (this.openTabs.length === 0) {
         for (const candidate of workspaceRestoreCandidates(metadata)) {
@@ -7075,6 +7742,7 @@ export class TypsastraWorkspaceController {
           if (this.activeFilePath) break;
         }
       }
+      await this.persistWorkspaceRecovery();
     } catch (e) {
       console.warn("Failed to restore workspace state:", e);
       throw e;
@@ -7110,6 +7778,12 @@ export class TypsastraWorkspaceController {
       return;
     }
 
+    if (change.kind === "rename") {
+      const pair = await this.externalRenamePair(externalPaths);
+      if (pair) await this.offerExternalMovedReferenceUpdates(workspaceRoot, pair.oldPath, pair.newPath);
+      if (this.workspaceRootPath !== workspaceRoot) return;
+    }
+
     const openPathKeysBeforeReload = new Set(this.openTabs.map(tab => filePathKey(tab.path)));
 
     // One ordered synchronization path: editor state, render mirror, LSP, preview.
@@ -7133,9 +7807,9 @@ export class TypsastraWorkspaceController {
       return;
     }
 
-    // A dirty tab intentionally keeps its in-memory revision. Do not let the
-    // conflicting disk revision update Tinymist, the prepared render mirror,
-    // or the PDF source-map task behind that editor buffer.
+    // A path remains conflicted only when its disk change cannot be represented
+    // as an editor revision (for example, a dirty open file was removed).
+    // Content revisions are accepted into the editor undo/redo history.
     const acceptedPaths = acceptedExternalChangePaths(
       externalPaths,
       filePathKey,
@@ -7152,14 +7826,16 @@ export class TypsastraWorkspaceController {
       message: `Accepted workspace ${change.kind}: ${acceptedPaths.join(", ")}`
     });
 
-    // External edits must use the same ordered path as editor-driven renders.
-    // That path rebuilds the mirror and source map, synchronizes Tinymist's
-    // already-open generated documents, exports the replacement PDF, and then
-    // warms a source-map session for that exact revision.
-    this.externalPreviewRefreshPending = true;
+    // Only compiler inputs invalidate the PDF. A dynamic or not-yet-known
+    // manifest conservatively owns the whole workspace.
+    const affectsPreview = this.pathParticipatesInCurrentPreview(this.activeFilePath)
+      && acceptedPaths.some(path => this.pathParticipatesInCurrentPreview(path));
+    this.externalPreviewRefreshPending = affectsPreview;
     this.updateManualForwardSyncAction();
     try {
-      await this.retirePdfSourceMapSession("accepted external workspace change");
+      if (affectsPreview) {
+        await this.retirePdfSourceMapSession("accepted external workspace change");
+      }
       if (this.lspReady && this.lspClient) {
         const defaultType: 1 | 2 | 3 = change.kind === "create" ? 1 : change.kind === "remove" ? 3 : 2;
         const lastPathIndex = acceptedPaths.length - 1;
@@ -7175,8 +7851,10 @@ export class TypsastraWorkspaceController {
       }
       await this.explorer.loadWorkspace(workspaceRoot);
       if (this.workspaceRootPath !== workspaceRoot) return;
-      await this.refreshActivePreviewRoot(true);
-      await this.waitForExternalPreviewRefresh();
+      if (affectsPreview) {
+        await this.refreshPreviewAfterDependencyChange(true);
+        await this.waitForExternalPreviewRefresh();
+      }
     } finally {
       this.externalPreviewRefreshPending = false;
       this.updateManualForwardSyncAction();
@@ -7390,6 +8068,7 @@ export class TypsastraWorkspaceController {
         `pdf=${mib(preview.pdfBytes)} MiB/${preview.pdfPages} pages/gen ${preview.pdfGeneration}`,
         `pdfTransport=${preview.pdfTransport}; pdfRead=${mib(preview.pdfBytesRead)} MiB/${preview.pdfRangeRequests} range request(s)`,
         `finalCanvas=${preview.residentFinalCanvases}; mountedCanvas=${preview.residentCanvases} (${mib(preview.canvasPixels * 4)} MiB estimated RGBA)`,
+        `previewQuality=${preview.qualityMode}; displayScale=${preview.displayScale}`,
         `fontFaces=${preview.fontFaces}`,
         `activeRenders=${preview.activeRenders}; pdfLoading=${preview.loading}`,
         `lastPdfPath=${this.lastPdfPath || "none"}`,
@@ -7401,6 +8080,10 @@ export class TypsastraWorkspaceController {
   }
 
   private async reloadOpenFilesFromDisk(refreshPreview = true): Promise<boolean> {
+    // The watcher may fire before the editor mutation debounce has copied the
+    // visible CodeMirror document into its tab. Settle that snapshot first so
+    // clash decisions never compare the disk revision with stale tab content.
+    this.flushEditorContentMutation();
     let changed = false;
     for (const tab of [...this.openTabs]) {
       const pathKey = filePathKey(tab.path);
@@ -7455,59 +8138,84 @@ export class TypsastraWorkspaceController {
         changed = true;
         continue;
       }
-      if (tab.isDirty) {
-        this.reportExternalConflict(tab.path, "changed outside Typsastra");
-        changed = true;
-        continue;
-      }
-
       this.externalConflictPaths.delete(pathKey);
       await this.applyExternalFileContent(tab, contents, refreshPreview);
       changed = true;
     }
+    if (changed) await this.persistWorkspaceRecovery();
     return changed;
   }
 
   private async applyExternalFileContent(tab: EditorTab, contents: string, refreshPreview = true): Promise<void> {
     const isActive = this.activeFilePath !== null && filePathKey(tab.path) === filePathKey(this.activeFilePath);
+    const previousContent = isActive && !isBinaryImagePath(tab.path) && fileExtension(tab.path) !== "pdf"
+      ? this.editorInstance.state.doc.toString()
+      : tab.content;
     tab.content = contents;
     tab.savedContent = contents;
     tab.contentLoaded = true;
     tab.isDirty = false;
-    tab.undoHistory = undefined;
 
     if (!isActive) {
+      if (!isBinaryImagePath(tab.path) && fileExtension(tab.path) !== "pdf") {
+        const state = createTabEditorState({
+          doc: previousContent,
+          anchor: tab.selectionAnchor,
+          head: tab.selectionHead,
+          extensions: this.editorExtensions,
+          undoHistory: tab.undoHistory,
+        });
+        const updated = externalEditorTextUpdate(state, contents).state;
+        tab.selectionAnchor = updated.selection.main.anchor;
+        tab.selectionHead = updated.selection.main.head;
+        tab.undoHistory = captureEditorUndoHistory(updated);
+        tab.foldRanges = [];
+        // Tinymist treats an open text document as authoritative over disk.
+        // Closing an inactive revision lets the workspace-file notification
+        // reload the accepted disk snapshot instead of retaining stale text.
+        await this.closeDocumentIfOpened(tab.path);
+      } else {
+        tab.undoHistory = undefined;
+      }
       this.renderEditorTabs();
       return;
     }
 
     if (isBinaryImagePath(tab.path)) {
-      const img = document.getElementById("image-viewer-img") as HTMLImageElement;
-      if (img) img.src = contents;
+      this.renderEditorImageViewer(contents, tab.path);
       this.renderEditorTabs();
       return;
     }
 
     if (fileExtension(tab.path) === "pdf") {
       if (refreshPreview) {
-        void this.loadPdfPath(tab.path, tab.path);
+        void this.renderEditorPdfViewer(tab.path);
       }
       this.renderEditorTabs();
       return;
     }
 
     const selection = this.editorInstance.state.selection.main;
+    if (this.pendingEditorMutationTimer !== null) {
+      window.clearTimeout(this.pendingEditorMutationTimer);
+      this.pendingEditorMutationTimer = null;
+    }
+    this.pendingEditorMutation = null;
+    this.clearPendingLspSync();
+    const lspRequestKey = filePathKey(tab.path);
+    this.lspSyncRequestGenerations.set(
+      lspRequestKey,
+      (this.lspSyncRequestGenerations.get(lspRequestKey) ?? 0) + 1,
+    );
+    if (this.pathParticipatesInCurrentPreview(tab.path)) {
+      this.invalidatePreviewWork("external file revision");
+    }
     this.isLoadingFile = true;
     try {
       // Keep external reloads atomic from the user's perspective as well: the
       // matching Unicode font policy must precede the replacement text.
       const editorFontEffect = this.editorFontManager.prepareDocument(contents);
-      this.editorInstance.setState(createTabEditorState({
-        doc: contents,
-        anchor: Math.min(selection.anchor, contents.length),
-        head: Math.min(selection.head, contents.length),
-        extensions: this.editorExtensions,
-      }));
+      this.editorInstance.dispatch(externalEditorTextUpdate(this.editorInstance.state, contents));
       this.editorInstance.dispatch({
         effects: [
           ...this.currentEditorSettingsEffects(),
@@ -7518,6 +8226,9 @@ export class TypsastraWorkspaceController {
     } finally {
       this.isLoadingFile = false;
     }
+    tab.selectionAnchor = Math.min(selection.anchor, contents.length);
+    tab.selectionHead = Math.min(selection.head, contents.length);
+    tab.undoHistory = captureEditorUndoHistory(this.editorInstance.state);
 
     this.renderEditorTabs();
     if (tab.path.toLowerCase().endsWith(".typ")) {
@@ -7556,8 +8267,7 @@ export class TypsastraWorkspaceController {
     }
     if (
       refreshPreview
-      && participatesInPreviewCompilation(tab.path, this.pinnedMainFilePath, tab.previewImported)
-      && tab.path.toLowerCase().endsWith(".typ")
+      && this.pathParticipatesInCurrentPreview(tab.path)
       && !tab.previewDisabled
     ) {
       if (this.effectivePreviewRenderMode === "on-save") {
@@ -7576,13 +8286,77 @@ export class TypsastraWorkspaceController {
     });
   }
 
-  private noMainFileMessage(): string {
-    return (
-      `<div class="preview-disabled-placeholder">` +
-      `<div class="preview-disabled-title preview-accent-title" style="font-size:18px;margin-bottom:12px;">No Main File Selected</div>` +
-      `<div class="preview-disabled-msg">Right-click any <code style="background:var(--ui-hover);padding:1px 5px;border-radius:3px;">.typ</code> file in the Explorer and choose <strong>Set as Main File</strong> to enable live preview and export.</div>` +
-      `</div>`
+  private currentPreviewCompilationRoot(): string | null {
+    if (this.previewDisabled) return null;
+    return this.previewStandalone
+      ? (this.previewRootPath ?? (isTypstDocumentPath(this.activeFilePath ?? "") ? this.activeFilePath : null))
+      : (this.previewMainPath ?? this.previewRootPath);
+  }
+
+  private installPreviewDependencyManifest(
+    rootPath: string,
+    dependencyFiles: readonly string[],
+    complete: boolean
+  ): void {
+    const currentRoot = this.currentPreviewCompilationRoot();
+    if (!currentRoot || filePathKey(this.mapToOriginalPath(currentRoot)) !== filePathKey(rootPath)) return;
+    this.previewDependencyRootKey = filePathKey(rootPath);
+    this.previewDependencyPathKeys = new Set(
+      dependencyFiles.map(path => filePathKey(this.mapToOriginalPath(path)))
     );
+    this.previewDependencyPathKeys.add(filePathKey(rootPath));
+    this.previewDependencyManifestComplete = complete;
+  }
+
+  private pathParticipatesInCurrentPreview(path: string | null): boolean {
+    if (!path || this.previewDisabled) return false;
+    const root = this.currentPreviewCompilationRoot();
+    if (!root) return false;
+    const originalPath = this.mapToOriginalPath(path);
+    const originalRoot = this.mapToOriginalPath(root);
+    const pathKey = filePathKey(originalPath);
+    const rootKey = filePathKey(originalRoot);
+    if (pathKey === rootKey) return true;
+    if (this.previewDependencyRootKey === rootKey && this.previewDependencyPathKeys.has(pathKey)) {
+      return true;
+    }
+    if (
+      (this.previewDependencyRootKey !== rootKey || this.previewDependencyManifestComplete === false)
+      && this.workspaceRootPath
+      && relativeFilePath(this.workspaceRootPath, originalPath) !== null
+    ) {
+      // A computed path cannot be enumerated statically. Match typst watch's
+      // correctness by treating any workspace edit as potentially relevant.
+      return true;
+    }
+    return isTypstDocumentPath(path) && this.previewImported;
+  }
+
+  private editorRenderOverlays(activeContents: string): Array<{ filePath: string; sourceText: string }> {
+    if (!this.workspaceRootPath) return [];
+    const activeKey = filePathKey(this.activeFilePath ?? "");
+    return this.openTabs
+      .filter(tab => tab.contentLoaded)
+      .filter(tab => this.isInternallySupportedPath(tab.path))
+      .filter(tab => !isBinaryImagePath(tab.path) && fileExtension(tab.path) !== "pdf")
+      .filter(tab => relativeFilePath(this.workspaceRootPath!, this.mapToOriginalPath(tab.path)) !== null)
+      .map(tab => ({
+        filePath: this.mapToOriginalPath(tab.path),
+        sourceText: filePathKey(tab.path) === activeKey ? activeContents : tab.content
+      }));
+  }
+
+  private async refreshPreviewAfterDependencyChange(force = true): Promise<void> {
+    if (!this.activeFilePath || !this.pathParticipatesInCurrentPreview(this.activeFilePath)) return;
+    if (isTypstDocumentPath(this.activeFilePath)) {
+      await this.refreshActivePreviewRoot(force);
+      return;
+    }
+    const activeTab = this.getActiveTab();
+    const contents = activeTab?.contentLoaded
+      ? this.editorInstance.state.doc.toString()
+      : activeTab?.content ?? "";
+    await this.renderPdfPreview(contents, force);
   }
 
   private disabledPreviewMessage(): string {
@@ -7596,7 +8370,7 @@ export class TypsastraWorkspaceController {
     );
   }
 
-  private renderNonTextEditorPlaceholder(path: string, unsupported: boolean): void {
+  private renderNonTextEditorPlaceholder(path: string, unsupported: boolean, overrideDescription?: string): void {
     const info = document.getElementById("image-viewer-info");
     if (!info) return;
 
@@ -7619,11 +8393,11 @@ export class TypsastraWorkspaceController {
 
     const description = document.createElement("div");
     description.className = "preview-disabled-msg";
-    description.textContent = isPdf
+    description.textContent = overrideDescription ?? (isPdf
       ? "This document is displayed in the live preview pane."
       : unsupported
         ? "This file format cannot be displayed in Typsastra."
-        : "Cannot load raw binary in the text editor.";
+        : "Cannot load raw binary in the text editor.");
 
     placeholder.append(icon, title, fileName, description);
     if (unsupported || isPdf) {
@@ -7643,22 +8417,15 @@ export class TypsastraWorkspaceController {
     const path = tab.path;
     const codeRenderPane = document.getElementById("code-render-pane");
     const imageViewerPane = document.getElementById("image-viewer-pane");
-    const imageViewerImg = document.getElementById("image-viewer-img") as HTMLImageElement | null;
     const info = document.getElementById("image-viewer-info");
 
     codeRenderPane?.classList.add("hidden");
     imageViewerPane?.classList.remove("hidden");
-    if (imageViewerImg) imageViewerImg.style.display = "none";
     document.getElementById("wysiwym-editor-pane")?.classList.add("hidden");
+    if (notice.kind === "pdf") this.prepareEditorFileViewer(path, "placeholder");
 
     if (notice.kind === "pdf") {
-      // A guarded PDF owns the preview pane as soon as its tab is selected.
-      // Leaving the previous compiler preview mounted makes it appear that the
-      // unopened PDF is already visible and allows an in-flight Typst render
-      // to repaint the stale document behind the confirmation.
       this.blockedLargePdfPaths.add(filePathKey(path));
-      this.pdfLoadRequestGeneration += 1;
-      this.invalidatePreviewWork(`waiting for confirmation to open ${path}`);
     } else if (isTypstDocumentPath(path)) {
       this.workspaceServicesDeferredForLargeFile = true;
       this.blockedLargePreviewRoot = notice.previewRootPath ?? path;
@@ -7703,7 +8470,7 @@ export class TypsastraWorkspaceController {
       const description = document.createElement("div");
       description.className = "preview-disabled-msg";
       const work = notice.kind === "pdf"
-        ? "Confirm in the preview pane before Typsastra decodes and renders it."
+        ? "Confirm here before Typsastra decodes and renders it."
         : notice.kind === "main-preview"
           ? `This file belongs to a large preview rooted at ${fileNameFromPath(notice.previewRootPath ?? "the configured main file")}. Opening it will initialize the editor and start that compiler preview.`
           : isTypstDocumentPath(path)
@@ -7733,39 +8500,31 @@ export class TypsastraWorkspaceController {
       };
 
       content.append(icon, title, fileName, description);
-      if (notice.kind === "pdf") {
-        this.previewFrame.setConfirmationMessage({
-          title: "Large PDF Preview Not Started",
-          message: `${fileNameFromPath(path)} is ${formatFileSize(notice.sizeBytes)}. Opening it will decode the PDF and begin rendering visible pages.`,
-          confirmLabel: "Open Large PDF",
-          pairedGuardrail: true,
-          onConfirm: openConfirmedFile
-        });
-      } else {
-        const confirmButton = document.createElement("button");
-        confirmButton.type = "button";
-        confirmButton.className = "editor-file-placeholder-action";
-        const confirmLabel = isTypstDocumentPath(path) ? "Open and Compile Preview" : "Open Large File";
-        confirmButton.textContent = confirmLabel;
-        confirmButton.addEventListener("click", () => {
-          confirmButton.disabled = true;
-          confirmButton.textContent = "Opening…";
-          void openConfirmedFile().catch(error => {
-            console.error("Failed to open large file:", error);
-            confirmButton.disabled = false;
-            confirmButton.textContent = confirmLabel;
-            void message(`Could not open ${fileNameFromPath(path)}: ${String(error)}`, {
-              title: "Unable to Open File",
-              kind: "error"
-            });
+      const confirmButton = document.createElement("button");
+      confirmButton.type = "button";
+      confirmButton.className = "editor-file-placeholder-action";
+      const confirmLabel = notice.kind === "pdf"
+        ? "Open Large PDF"
+        : isTypstDocumentPath(path) ? "Open and Compile Preview" : "Open Large File";
+      confirmButton.textContent = confirmLabel;
+      confirmButton.addEventListener("click", () => {
+        confirmButton.disabled = true;
+        confirmButton.textContent = "Opening…";
+        void openConfirmedFile().catch(error => {
+          console.error("Failed to open large file:", error);
+          confirmButton.disabled = false;
+          confirmButton.textContent = confirmLabel;
+          void message(`Could not open ${fileNameFromPath(path)}: ${String(error)}`, {
+            title: "Unable to Open File",
+            kind: "error"
           });
         });
-        content.append(confirmButton);
-      }
+      });
+      content.append(confirmButton);
       placeholder.append(content);
       info.replaceChildren(placeholder);
     }
-    this.observeGuardrailAlignment();
+    if (notice.kind !== "pdf") this.observeGuardrailAlignment();
 
     this.activeFilePath = path;
     this.activateSpellcheckDocument(null);
@@ -7774,7 +8533,7 @@ export class TypsastraWorkspaceController {
     this.clearPendingLspSync();
     this.previewSyncController.clearForward();
     this.editorToolbarController.setDisabled(true);
-    this.updatePreviewActionsToolbar(path);
+    this.updatePreviewActionsToolbar(notice.kind === "pdf" ? this.pinnedMainFilePath : path);
     this.updateManualForwardSyncAction();
     this.updateWorkspaceViewportVisibility();
     this.renderEditorTabs();
@@ -7825,133 +8584,6 @@ export class TypsastraWorkspaceController {
     }
   }
 
-  private renderInteractiveImageViewer(src: string) {
-    this.updatePreviewActionsToolbar(this.activeFilePath);
-
-    this.previewFrame.setMessage(
-      `<div id="interactive-image-container" style="position:relative;width:100%;height:100%;background:var(--ui-bg);overflow:hidden;display:flex;align-items:center;justify-content:center;user-select:none;box-sizing:border-box;">` +
-      `<img id="interactive-image-el" alt="Image preview" draggable="false" style="max-width:none;max-height:none;position:absolute;cursor:grab;user-select:none;will-change:transform;visibility:hidden;" />` +
-      `</div>`
-    );
-
-    const container = document.getElementById("interactive-image-container");
-    const img = document.getElementById("interactive-image-el") as HTMLImageElement | null;
-
-    if (!container || !img) return;
-
-    let scale = 1;
-    let x = 0;
-    let y = 0;
-    let isDragging = false;
-    let startX = 0;
-    let startY = 0;
-    let isFit = true;
-
-    const updateTransform = () => {
-      img.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
-    };
-
-    const resetToFit = () => {
-      const cWidth = container.clientWidth;
-      const cHeight = container.clientHeight;
-      const iWidth = img.naturalWidth;
-      const iHeight = img.naturalHeight;
-      if (cWidth <= 0 || cHeight <= 0 || iWidth <= 0 || iHeight <= 0) return;
-
-      const scaleX = cWidth / iWidth;
-      const scaleY = cHeight / iHeight;
-      scale = Math.min(scaleX, scaleY, 1);
-      x = 0;
-      y = 0;
-      updateTransform();
-      img.style.visibility = "visible";
-    };
-
-    const zoomInImg = () => {
-      const zoomFactor = 1.2;
-      scale = Math.min(scale * zoomFactor, 20);
-      isFit = false;
-      updateTransform();
-      this.updatePreviewZoomLabel(scale);
-    };
-
-    const zoomOutImg = () => {
-      const zoomFactor = 1.2;
-      scale = Math.max(scale / zoomFactor, 0.05);
-      isFit = false;
-      updateTransform();
-      this.updatePreviewZoomLabel(scale);
-    };
-
-    const zoomToFitImg = () => {
-      resetToFit();
-      isFit = true;
-      this.updatePreviewZoomLabel(scale);
-    };
-
-    this.imageZoomIn = zoomInImg;
-    this.imageZoomOut = zoomOutImg;
-    this.imageZoomToFit = zoomToFitImg;
-    this.imageZoomPercent = () => scale;
-    this.imageIsFit = () => isFit;
-
-    img.onload = () => {
-      requestAnimationFrame(() => {
-        resetToFit();
-        isFit = true;
-        this.updatePreviewZoomLabel(scale);
-      });
-    };
-    img.onerror = () => this.previewFrame.setError(
-      "Image preview unavailable",
-      "Typsastra could not decode this image."
-    );
-    img.src = src;
-
-    container.addEventListener("wheel", (e) => {
-      e.preventDefault();
-      const zoomFactor = 1.1;
-      const rect = container.getBoundingClientRect();
-      const mouseX = e.clientX - rect.left - rect.width / 2;
-      const mouseY = e.clientY - rect.top - rect.height / 2;
-
-      const prevScale = scale;
-      if (e.deltaY < 0) {
-        scale = Math.min(scale * zoomFactor, 20);
-      } else {
-        scale = Math.max(scale / zoomFactor, 0.05);
-      }
-
-      x = mouseX - (mouseX - x) * (scale / prevScale);
-      y = mouseY - (mouseY - y) * (scale / prevScale);
-      isFit = false;
-      updateTransform();
-      this.updatePreviewZoomLabel(scale);
-    }, { passive: false });
-
-    container.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      isDragging = true;
-      img.style.cursor = "grabbing";
-      startX = e.clientX - x;
-      startY = e.clientY - y;
-      e.preventDefault();
-    });
-
-    window.addEventListener("mousemove", (e) => {
-      if (!isDragging) return;
-      x = e.clientX - startX;
-      y = e.clientY - startY;
-      updateTransform();
-    });
-
-    window.addEventListener("mouseup", () => {
-      if (isDragging) {
-        isDragging = false;
-        img.style.cursor = "grab";
-      }
-    });
-  }
 
   private async refreshActivePreviewRoot(forceRender = false): Promise<void> {
     if (!this.activeFilePath) return;
@@ -7966,22 +8598,20 @@ export class TypsastraWorkspaceController {
     this.imageZoomPercent = null;
     this.imageIsFit = null;
 
-    this.updatePreviewActionsToolbar(path);
+    this.updatePreviewActionsToolbar(unsupportedFile || isBinaryImagePath(path) || isPdf
+      ? this.pinnedMainFilePath
+      : path);
 
     if (unsupportedFile || isBinaryImagePath(path) || isPdf) {
       const tab = this.getActiveTab();
       if (!tab) return;
       if (isBinaryImagePath(path)) {
-        this.renderInteractiveImageViewer(tab.content);
+        this.renderEditorImageViewer(tab.content, path);
       } else if (isPdf) {
-        void this.loadPdfPath(path, path);
+        void this.renderEditorPdfViewer(path);
       } else {
-        this.previewFrame.setMessage(
-          `<div class="preview-disabled-placeholder">` +
-          `<div class="preview-disabled-title">Preview Unavailable</div>` +
-          `<div class="preview-disabled-msg">Open this file with its system application to view it.</div>` +
-          `</div>`
-        );
+        this.prepareEditorFileViewer(path, "placeholder");
+        this.renderNonTextEditorPlaceholder(path, true);
       }
       return;
     }
@@ -8003,10 +8633,6 @@ export class TypsastraWorkspaceController {
       );
       return;
     }
-    if (!this.pinnedMainFilePath) {
-      this.previewFrame.setMessage(this.noMainFileMessage());
-      return;
-    }
     const activeTab = this.getActiveTab();
     const contents = activeTab?.contentLoaded
       ? this.editorInstance.state.doc.toString()
@@ -8015,7 +8641,8 @@ export class TypsastraWorkspaceController {
       filePath: this.activeFilePath,
       workspaceRootPath: this.workspaceRootPath,
       fileContents: contents,
-      pinnedMainPath: this.pinnedMainFilePath
+      pinnedMainPath: this.pinnedMainFilePath,
+      alwaysUsePinnedMain: this.settingsController.value.editor.keepMainFilePreview
     });
     if (target.disabled) {
       if (activeTab) {
@@ -8128,6 +8755,15 @@ export class TypsastraWorkspaceController {
           );
           void this.saveWorkspaceState();
         },
+      );
+      this.settingsController.setProjectInsertionTemplates(
+        this.workspaceMetadata.project.insertionTemplates,
+        layer => {
+          if (!this.workspaceMetadata) return;
+          this.workspaceMetadata.project.insertionTemplates = layer;
+          this.editorToolbarController.renderTemplateStrip();
+          void this.saveWorkspaceState();
+        }
       );
       await this.restoreWorkspaceToolchain(this.workspaceMetadata);
       const expandedDirectories = (await Promise.all(
@@ -8738,6 +9374,7 @@ export class TypsastraWorkspaceController {
 
     this.workspaceRootPath = null;
     this.workspaceMetadata = null;
+    this.settingsController.setProjectInsertionTemplates(null);
     this.settingsController.setWorkspacePreviewRenderMode(null);
     this.lastPreviewRenderMode = this.settingsController.value.preview.renderMode;
     this.workspaceLoading = false;
@@ -8820,6 +9457,7 @@ export class TypsastraWorkspaceController {
     installModalFocusTrap();
     import("@tauri-apps/api/event").then(({ listen, emit }) => {
       listen("preview-window-ready", () => {
+        void emit("preview-quality-update", this.settingsController.value.preview.quality);
         if (this.lastPdfPath) {
           emit("pdf-update", {
             path: this.lastPdfPath,
@@ -8860,12 +9498,14 @@ export class TypsastraWorkspaceController {
     });
 
     window.addEventListener("beforeunload", () => {
+      this.previewScaleUnlisten?.();
+      this.previewScaleUnlisten = null;
       this.systemResumeMonitor.stop();
       if (this.pdfSyncRegisteredTaskId && this.lspClient) {
         void this.lspClient.stopPreview(this.pdfSyncRegisteredTaskId).catch(() => {});
       }
       this.workspaceWatcher.stop();
-      this.saveWorkspaceState();
+      void this.saveWorkspaceState();
       this.settingsController.flush();
     });
 
@@ -8915,6 +9555,14 @@ export class TypsastraWorkspaceController {
       
       if (cmdOrCtrl && e.shiftKey && ["KeyI", "KeyC", "KeyF", "KeyJ", "KeyR"].includes(keyCode)) {
         e.preventDefault();
+      }
+
+      if (cmdOrCtrl && e.shiftKey && !e.altKey && keyCode === "KeyD") {
+        e.preventDefault();
+        this.settingsController.update(settings => {
+          settings.editor.fileDropCreateFigures = !settings.editor.fileDropCreateFigures;
+        });
+        return;
       }
 
       if (cmdOrCtrl && e.shiftKey && !e.altKey && keyCode === "KeyF") {
@@ -9107,7 +9755,6 @@ export class TypsastraWorkspaceController {
           const cacheRoot = this.getCacheRootPath();
           if (cacheRoot && this.workspaceRootPath) {
             const originalRootPath = this.mapToOriginalPath(rootPath);
-            const originalActivePath = this.mapToOriginalPath(this.activeFilePath);
             
             const options = {
               enableKhmerZws: this.settingsController.value.preview.khmerRenderPreparation,
@@ -9119,25 +9766,8 @@ export class TypsastraWorkspaceController {
               previewContentMode: "normal"
             };
 
-            const result = await invoke<{ generatedEntryFile: string }>("prepare_render_project", { options });
-            
-            const tabsToOverlay = this.openTabs
-              .filter(tab => tab.contentLoaded)
-              .filter(tab => tab.path.toLowerCase().endsWith(".typ"))
-              .filter(tab => this.workspaceRootPath && relativeFilePath(this.workspaceRootPath, this.mapToOriginalPath(tab.path)) !== null);
-            
-            for (const tab of tabsToOverlay) {
-              const originalTabPath = this.mapToOriginalPath(tab.path);
-              const sourceCode = filePathKey(originalTabPath) === filePathKey(originalActivePath)
-                ? content
-                : tab.content;
-              
-              await invoke("prepare_render_file", {
-                options,
-                filePath: originalTabPath,
-                sourceCode
-              });
-            }
+            const overlays = this.editorRenderOverlays(content);
+            const result = await invoke<{ generatedEntryFile: string }>("prepare_render_project", { options, overlays });
 
             targetFilePath = result.generatedEntryFile;
             targetContent = await invoke<string>("read_workspace_file", { path: targetFilePath }).catch(() => "");
@@ -9434,6 +10064,27 @@ export class TypsastraWorkspaceController {
       }
       if (proceed) proceed = await this.appUpdateController.prepareForClose();
       if (proceed) {
+        await this.saveWorkspaceState();
+        if (hasUnsaved && this.workspaceRootPath) {
+          await this.workspaceRecoveryStore.save(this.workspaceRootPath, {
+            schemaVersion: 1,
+            updatedAtMs: Date.now(),
+            tabs: [],
+          }).catch(error => {
+            this.appendDeveloperLog({
+              kind: "error",
+              source: "workspace",
+              message: `Failed to discard crash recovery data during normal exit: ${String(error)}`,
+            });
+          });
+        }
+        await this.workspaceRecoveryStore.flush().catch(error => {
+          this.appendDeveloperLog({
+            kind: "error",
+            source: "workspace",
+            message: `Failed to flush crash recovery data before exit: ${String(error)}`,
+          });
+        });
         try {
           const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
           const previewWin = await WebviewWindow.getByLabel("preview");
@@ -9647,18 +10298,16 @@ export class TypsastraWorkspaceController {
 
 
   private async prepareRenderProjectIfNeeded(): Promise<void> {
-    if (!this.workspaceRootPath || !this.pinnedMainFilePath) return;
+    if (!this.workspaceRootPath) return;
     const cacheRoot = this.getCacheRootPath();
     if (!cacheRoot) return;
 
-    // Cache preparation is shared by render-on-save and render-on-type. Their
-    // only difference is the trigger: explicit save versus debounced input.
-    // Always mirror the configured main document, never whichever dependency
-    // happens to be active while the workspace or LSP is starting.
-    const entryFile = this.mapToOriginalPath(this.pinnedMainFilePath);
+    const rootPath = this.currentPreviewCompilationRoot() ?? this.pinnedMainFilePath;
+    if (!rootPath || !isTypstDocumentPath(rootPath)) return;
+    const entryFile = this.mapToOriginalPath(rootPath);
 
     try {
-      await invoke("prepare_render_project", {
+      const result = await invoke<RenderPreparationResult>("prepare_render_project", {
         options: {
           enableKhmerZws: this.settingsController.value.preview.khmerRenderPreparation,
           projectRoot: this.workspaceRootPath,
@@ -9666,8 +10315,10 @@ export class TypsastraWorkspaceController {
           cacheRoot,
           generateSourceMap: true,
           previewContentMode: "normal"
-        }
+        },
+        overlays: []
       });
+      this.installPreviewDependencyManifest(entryFile, result.dependencyFiles, result.dependencyManifestComplete);
     } catch (e) {
       console.error("Failed to prepare render project:", e);
     }

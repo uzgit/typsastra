@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+pub mod dependencies;
 pub mod draft;
 pub mod draft_thumbnail;
 pub mod mirror;
@@ -13,8 +14,8 @@ pub use draft_thumbnail::{
 };
 pub use mirror::{
     mirror_project_cancellable, prepare_single_in_memory_file,
-    validate_existing_render_cache_owner, RenderPrepareOptions, RenderPrepareResult,
-    RenderPrepareWarning,
+    validate_existing_render_cache_owner, RenderPrepareOptions, RenderPrepareOverlay,
+    RenderPrepareResult, RenderPrepareWarning,
 };
 pub use segment::KhmerTextSegmenter;
 pub use sourcemap::SourceMap;
@@ -33,6 +34,7 @@ pub fn cancel_render_preparation() {
 #[tauri::command]
 pub async fn prepare_render_project(
     options: RenderPrepareOptions,
+    overlays: Option<Vec<RenderPrepareOverlay>>,
 ) -> Result<RenderPrepareResult, String> {
     let epoch = RENDER_PREPARATION_EPOCH.load(Ordering::Acquire);
     tokio::task::spawn_blocking(move || -> Result<RenderPrepareResult, String> {
@@ -44,9 +46,16 @@ pub async fn prepare_render_project(
         } else {
             None
         };
-        mirror_project_cancellable(&options, segmenter.as_ref(), || {
+        let mut result = mirror_project_cancellable(&options, segmenter.as_ref(), || {
             RENDER_PREPARATION_EPOCH.load(Ordering::Acquire) != epoch
-        })
+        })?;
+        mirror::apply_render_overlays_and_collect_dependencies(
+            &options,
+            segmenter.as_ref(),
+            overlays.as_deref().unwrap_or(&[]),
+            &mut result,
+        )?;
+        Ok(result)
     })
     .await
     .map_err(|e| e.to_string())?

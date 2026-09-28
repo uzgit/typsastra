@@ -29,7 +29,8 @@ describe("cross-platform scrollbar design", () => {
     const controller = await Bun.file(new URL("../src/appController.ts", import.meta.url)).text();
     expect(source).toContain('export type PreviewSurface = "live" | "pdf"');
     expect(source).toContain('iframeDoc.documentElement.dataset.previewSurface = surface');
-    expect(source).toContain(':root[data-preview-surface="pdf"]{--preview-surface-bg:#b8b8b8}');
+    expect(source).toContain('copy("--ui-hover", "--preview-surface-bg", "#eeeeee")');
+    expect(source).not.toContain(':root[data-preview-surface="pdf"]{--preview-surface-bg:');
     expect(source).toContain('background:var(--preview-surface-bg)');
     expect(controller).toContain('surface: PreviewSurface = isTypstDocumentPath(identity) ? "live" : "pdf"');
     expect(controller).toContain('this.previewFrame.loadPdfBytes(bytes, identity, sessionKey, surface)');

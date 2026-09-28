@@ -49,6 +49,62 @@ export type LanguageCompletionResponse = {
   options: string[];
 };
 
+export type WorkspacePathEntry = {
+  path: string;
+  isDirectory: boolean;
+};
+
+export type TypstPathCompletionKind = "include" | "import" | "image" | "bibliography" | "data";
+
+export type TypstPathCompletionContext = {
+  from: number;
+  typedPath: string;
+  kind: TypstPathCompletionKind;
+};
+
+const IMAGE_PATH_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "avif", "pdf"]);
+
+function pathExtension(path: string): string {
+  const name = path.replace(/\/$/, "").split("/").pop() ?? "";
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+export function typstPathCompletionContext(
+  lineText: string,
+  cursorInLine: number,
+  lineFrom = 0,
+): TypstPathCompletionContext | null {
+  const before = lineText.slice(0, Math.max(0, Math.min(cursorInLine, lineText.length)));
+  const direct = /#(include|import)\s+(?:"([^"\r\n]*)|((?:\.{1,2}\/|\/)[^\s\])}]*))$/u.exec(before);
+  if (direct) {
+    const typedPath = direct[2] ?? direct[3] ?? "";
+    return {
+      from: lineFrom + cursorInLine - typedPath.length,
+      typedPath,
+      kind: direct[1] === "import" ? "import" : "include",
+    };
+  }
+  const call = /#?(image|bibliography|read|csv|json|yaml|xml)\s*\(\s*"([^"\r\n]*)$/u.exec(before);
+  if (!call) return null;
+  const typedPath = call[2] ?? "";
+  const kind: TypstPathCompletionKind = call[1] === "image"
+    ? "image"
+    : call[1] === "bibliography"
+      ? "bibliography"
+      : "data";
+  return { from: lineFrom + cursorInLine - typedPath.length, typedPath, kind };
+}
+
+export function workspacePathMatchesKind(entry: WorkspacePathEntry, kind: TypstPathCompletionKind): boolean {
+  if (entry.isDirectory) return true;
+  const extension = pathExtension(entry.path);
+  if (kind === "image") return IMAGE_PATH_EXTENSIONS.has(extension);
+  if (kind === "import") return extension === "typ";
+  if (kind === "include") return extension === "typ" || extension === "pdf";
+  if (kind === "bibliography") return ["bib", "yaml", "yml"].includes(extension);
+  return true;
+}
 export function languageCompletionRange(
   runFrom: number,
   runLength: number,
@@ -494,10 +550,47 @@ export function createTypstAutocomplete(
   getLanguageCompletionGeneration?: () => number,
   onLanguageCompletionPerformance?: (milliseconds: number) => void,
   onTypstCompletionTrace?: (message: string) => void,
+  projectPathCompletion = false,
+  getWorkspacePaths: () => Promise<WorkspacePathEntry[]> = async () => [],
 ) {
   return autocompletion({
     override: [
       async (context: CompletionContext) => {
+        if (projectPathCompletion && !context.view?.composing && context.state.selection.ranges.length === 1) {
+          const line = context.state.doc.lineAt(context.pos);
+          const pathContext = typstPathCompletionContext(
+            line.text,
+            context.pos - line.from,
+            line.from,
+          );
+          if (pathContext) {
+            try {
+              const documentIdentity = context.state.doc;
+              const entries = await getWorkspacePaths();
+              if (context.aborted
+                || (context.view && (context.view.state.doc !== documentIdentity
+                  || context.view.state.selection.main.head !== context.pos))) return null;
+              const options = entries
+                .filter(entry => workspacePathMatchesKind(entry, pathContext.kind))
+                .slice(0, 2_000)
+                .map(entry => ({
+                  label: entry.path,
+                  type: entry.isDirectory ? "folder" : "file",
+                  detail: entry.isDirectory ? "Project directory" : "Project file",
+                }));
+              if (options.length > 0) {
+                return {
+                  from: pathContext.from,
+                  options,
+                  validFor: /^[^"\s\])}]*$/u,
+                };
+              }
+            } catch (error) {
+              console.warn("Project path completion error", error);
+            }
+          }
+        }
+
         if (languageWordCompletion && !context.view?.composing && context.state.selection.ranges.length === 1) {
           const languageCompletionStartedAt = performance.now();
           const matches = getProviders()

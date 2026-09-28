@@ -34,7 +34,8 @@ describe("workspace state store", () => {
         projectId: "project-1",
         mainFile: "chapters/main.typ",
         recommendedToolchain: null,
-        terminology: []
+        terminology: [],
+        insertionTemplates: { order: [], disabled: [], overrides: {}, custom: [] }
       },
       workspace: {
         schemaVersion: 2,

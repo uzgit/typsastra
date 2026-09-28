@@ -6,7 +6,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import { closeCompletion } from "@codemirror/autocomplete";
 import { closeHoverTooltips, type EditorView } from "@codemirror/view";
 import { selectAll, toggleLineComment } from "@codemirror/commands";
-import type { WorkspaceExplorer } from "./explorer";
+import { topLevelExplorerSelections, type ExplorerSelection, type WorkspaceExplorer } from "./explorer";
 import type { SpellingIssue } from "../editor/spellcheck";
 
 export type ContextMenuDependencies = {
@@ -59,7 +59,7 @@ export function duplicateFileName(name: string): string {
 export class ContextMenuController {
   private targetPath = "";
   private targetIsDirectory = false;
-  private copiedFilePath: string | null = null;
+  private copiedEntries: ExplorerSelection[] = [];
   private textControl: HTMLInputElement | HTMLTextAreaElement | null = null;
   private selectedText = "";
   private contextText = "";
@@ -73,8 +73,9 @@ export class ContextMenuController {
   public initialize(): void {
     document.addEventListener("click", () => this.hide());
     this.menu.addEventListener("click", event => {
-      const action = (event.target as HTMLElement).closest<HTMLElement>(".dropdown-item")?.id;
-      if (action) {
+      const item = (event.target as HTMLElement).closest<HTMLElement>(".dropdown-item");
+      const action = item?.id;
+      if (action && !item?.classList.contains("dropdown-item-disabled")) {
         const restoreExplorerFocus = this.contextMenuOpenedFromExplorer;
         void this.execute(action).finally(() => {
           if (restoreExplorerFocus) this.dependencies.getExplorer().focus();
@@ -130,7 +131,7 @@ export class ContextMenuController {
     if (!action || event.repeat) return;
     const selection = this.dependencies.getExplorer().selectedEntry();
     if (action !== "paste" && !selection) return;
-    if (action === "paste" && !this.copiedFilePath) return;
+    if (action === "paste" && this.copiedEntries.length === 0) return;
 
     this.targetPath = selection?.path ?? this.dependencies.getWorkspaceRoot() ?? "";
     this.targetIsDirectory = selection?.isDirectory ?? true;
@@ -196,12 +197,15 @@ export class ContextMenuController {
         if (this.spellingIssue) this.dependencies.setSpellingIgnored(this.spellingIssue, !this.spellingIssue.ignored);
         return;
       case "ctx-fs-copy":
-        if (this.targetIsDirectory) alert("Copying directories directly is not yet supported.");
-        else this.copiedFilePath = this.targetPath;
+        this.copiedEntries = this.explorerSelections();
         return;
-      case "ctx-fs-reveal": if (this.targetPath) await invoke("reveal_in_explorer", { path: this.targetPath }); return;
+      case "ctx-fs-reveal":
+        if (this.explorerSelections().length === 1 && this.targetPath) await invoke("reveal_in_explorer", { path: this.targetPath });
+        return;
       case "ctx-fs-copy-rel-path": return this.copyRelativePath();
-      case "ctx-fs-copy-abs-path": if (this.targetPath) await writeText(this.targetPath); return;
+      case "ctx-fs-copy-abs-path":
+        await writeText(this.explorerSelections().map(entry => entry.path).join("\n"));
+        return;
       case "ctx-preview-open-external": return this.openPreviewPdf();
       case "ctx-preview-undock": document.getElementById("undock-preview-btn")?.click(); return;
       case "ctx-preview-forward-sync": document.getElementById("preview-forward-sync-btn")?.click(); return;
@@ -277,60 +281,82 @@ export class ContextMenuController {
     });
   }
 
-  private async deleteTarget(): Promise<void> {
-    if (!this.targetPath) return;
-    const path = this.targetPath;
+  private explorerSelections(): ExplorerSelection[] {
+    const selected = topLevelExplorerSelections(this.dependencies.getExplorer().selectedEntries());
+    if (selected.some(entry => entry.path === this.targetPath)) return selected;
+    return this.targetPath ? [{ path: this.targetPath, isDirectory: this.targetIsDirectory }] : [];
+  }
 
+  private async deleteTarget(): Promise<void> {
+    const entries = this.explorerSelections();
+    if (entries.length === 0) return;
     const mainFilePath = this.dependencies.getPinnedMainFile();
     if (mainFilePath) {
       const mainKey = mainFilePath.toLowerCase().replace(/\\/g, "/");
-      const targetKey = path.toLowerCase().replace(/\\/g, "/");
-      if (mainKey === targetKey || (this.targetIsDirectory && mainKey.startsWith(targetKey + "/"))) {
-        await message(`The active main document cannot be deleted.`, {
-          title: "Delete Blocked",
-          kind: "error"
+      const blocked = entries.some(entry => {
+        const targetKey = entry.path.toLowerCase().replace(/\\/g, "/").replace(/\/$/, "");
+        return mainKey === targetKey || (entry.isDirectory && mainKey.startsWith(targetKey + "/"));
+      });
+      if (blocked) {
+        await message("The active main document, or a folder containing it, cannot be deleted.", {
+          title: "Delete Blocked", kind: "error"
         });
         return;
       }
     }
-
-    const accepted = await confirm(`Are you sure you want to move this ${this.targetIsDirectory ? "folder" : "file"} to the Trash?`, {
-      title: "Confirm Delete", kind: "warning"
-    });
+    const accepted = await confirm(
+      entries.length === 1
+        ? `Move this ${entries[0].isDirectory ? "folder" : "file"} to the Trash?`
+        : `Move ${entries.length} selected items to the Trash?`,
+      { title: "Confirm Delete", kind: "warning" }
+    );
     if (!accepted) return;
+    const deleted: string[] = [];
     try {
-      await invoke("move_to_trash", { path });
+      for (const entry of entries) {
+        await invoke("move_to_trash", { path: entry.path });
+        deleted.push(entry.path);
+        await this.dependencies.closeTab(entry.path);
+      }
       await this.refreshExplorer();
-      await this.dependencies.closeTab(path);
-    } catch (error) { alert(`Failed to move to trash: ${error}`); }
+    } catch (error) {
+      await this.refreshExplorer();
+      alert(`Moved ${deleted.length} of ${entries.length} items to the Trash before an error occurred: ${error}`);
+    }
   }
 
   private async pasteFile(): Promise<void> {
     const workspace = this.dependencies.getWorkspaceRoot();
-    if (!workspace || !this.copiedFilePath) return;
+    if (!workspace || this.copiedEntries.length === 0) return;
     try {
-      const destination = await join(await this.parentDirectory(workspace), `Copy of ${await basename(this.copiedFilePath)}`);
-      await invoke("copy_workspace_file", { source: this.copiedFilePath, dest: destination });
+      const destinationDirectory = await this.parentDirectory(workspace);
+      const transfers = await Promise.all(this.copiedEntries.map(async entry => ({
+        sourcePath: entry.path,
+        destinationPath: await join(destinationDirectory, await basename(entry.path)),
+      })));
+      await invoke("copy_workspace_entries", { workspaceRootPath: workspace, transfers });
       await this.refreshExplorer();
-    } catch (error) { alert(`Failed to paste file: ${error}`); }
+    } catch (error) {
+      alert(`Nothing was pasted: ${error}`);
+    }
   }
 
   private async duplicateFile(): Promise<void> {
     const workspace = this.dependencies.getWorkspaceRoot();
-    if (!workspace || !this.targetPath || this.targetIsDirectory) return;
+    if (!workspace || !this.targetPath || this.explorerSelections().length !== 1) return;
     const source = this.targetPath;
     const defaultName = duplicateFileName(await basename(source));
     await new Promise<void>(resolve => {
-      this.dependencies.getExplorer().showInlineInput(source, "file", defaultName, async name => {
+      this.dependencies.getExplorer().showInlineInput(source, this.targetIsDirectory ? "folder" : "file", defaultName, async name => {
         if (name) {
           try {
             const destination = await join(await dirname(source), name);
             if (await invoke<boolean>("workspace_path_exists", { path: destination })) {
               alert(`A file named "${name}" already exists.`);
             } else {
-              await invoke("copy_workspace_file", { source, dest: destination });
+              await invoke("copy_workspace_entries", { workspaceRootPath: workspace, transfers: [{ sourcePath: source, destinationPath: destination }] });
               await this.refreshExplorer();
-              await this.dependencies.loadFile(destination);
+              if (!this.targetIsDirectory) await this.dependencies.loadFile(destination);
             }
           } catch (error) {
             alert(`Failed to duplicate file: ${error}`);
@@ -419,8 +445,10 @@ export class ContextMenuController {
   private async copyRelativePath(): Promise<void> {
     const workspace = this.dependencies.getWorkspaceRoot();
     if (!workspace || !this.targetPath) return;
-    const relative = this.targetPath.replace(workspace, "").replace(/^[\\/]/, "").replace(/\\/g, "/");
-    await writeText(relative);
+    const relative = this.explorerSelections().map(entry =>
+      entry.path.replace(workspace, "").replace(/^[\\/]/, "").replace(/\\/g, "/")
+    );
+    await writeText(relative.join("\n"));
   }
 
   private async openPreviewPdf(): Promise<void> {
@@ -458,7 +486,11 @@ export class ContextMenuController {
     const explorerItem = target.closest<HTMLElement>(".explorer-item-target");
     if (explorerItem) {
       this.contextMenuOpenedFromExplorer = true;
-      this.targetPath = explorerItem.dataset.path || "";
+      const clickedPath = explorerItem.dataset.path || "";
+      if (!explorerItem.classList.contains("selected")) {
+        this.dependencies.getExplorer().selectPath(clickedPath);
+      }
+      this.targetPath = clickedPath;
       this.targetIsDirectory = explorerItem.dataset.isDir === "true";
       event.preventDefault();
       this.show(this.explorerItems(), event.clientX, event.clientY);
@@ -550,12 +582,16 @@ export class ContextMenuController {
   }
 
   private explorerItems(): string {
-    const mainAction = this.mainFileItem();
-    return `${mainAction}<div class="dropdown-item" id="ctx-new-file">New File <span class="hotkey">Ctrl+N</span></div><div class="dropdown-item" id="ctx-fs-new-folder">New Folder</div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-fs-rename">Rename <span class="hotkey">F2</span></div><div class="dropdown-item" id="ctx-fs-delete">Delete <span class="hotkey">Delete</span></div>${this.targetIsDirectory ? "" : '<div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-fs-duplicate">Duplicate File</div><div class="dropdown-item" id="ctx-fs-copy">Copy File <span class="hotkey">Ctrl+C</span></div>'}${this.copiedFilePath ? '<div class="dropdown-item" id="ctx-fs-paste">Paste File <span class="hotkey">Ctrl+V</span></div>' : ""}<div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-fs-reveal">Reveal in System Explorer</div><div class="dropdown-item" id="ctx-fs-copy-rel-path">Copy Relative Path</div><div class="dropdown-item" id="ctx-fs-copy-abs-path">Copy Absolute Path</div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-open-project">Open Project <span class="hotkey">Ctrl+O</span></div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-restart-workspace">Reload Project</div>`;
+    const count = this.explorerSelections().length;
+    const single = count === 1;
+    const disabled = single ? "" : " dropdown-item-disabled";
+    const mainAction = single ? this.mainFileItem() : "";
+    const copyLabel = count > 1 ? `Copy ${count} Items` : "Copy";
+    return `${mainAction}<div class="dropdown-item" id="ctx-new-file">New File <span class="hotkey">Ctrl+N</span></div><div class="dropdown-item" id="ctx-fs-new-folder">New Folder</div><div class="dropdown-separator"></div><div class="dropdown-item${disabled}" id="ctx-fs-rename">Rename <span class="hotkey">F2</span></div><div class="dropdown-item" id="ctx-fs-delete">Delete <span class="hotkey">Delete</span></div><div class="dropdown-separator"></div><div class="dropdown-item${disabled}" id="ctx-fs-duplicate">Duplicate</div><div class="dropdown-item" id="ctx-fs-copy">${copyLabel} <span class="hotkey">Ctrl+C</span></div>${this.copiedEntries.length ? '<div class="dropdown-item" id="ctx-fs-paste">Paste <span class="hotkey">Ctrl+V</span></div>' : ""}<div class="dropdown-separator"></div><div class="dropdown-item${disabled}" id="ctx-fs-reveal">Reveal in System Explorer</div><div class="dropdown-item" id="ctx-fs-copy-rel-path">Copy Relative Path</div><div class="dropdown-item" id="ctx-fs-copy-abs-path">Copy Absolute Path</div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-open-project">Open Project <span class="hotkey">Ctrl+O</span></div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-restart-workspace">Reload Project</div>`;
   }
 
   private explorerBackgroundItems(): string {
-    return `<div class="dropdown-item" id="ctx-new-file">New File <span class="hotkey">Ctrl+N</span></div><div class="dropdown-item" id="ctx-fs-new-folder">New Folder</div>${this.copiedFilePath ? '<div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-fs-paste">Paste File <span class="hotkey">Ctrl+V</span></div>' : ""}<div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-fs-reveal">Reveal Project in Explorer</div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-open-project">Open Project <span class="hotkey">Ctrl+O</span></div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-restart-workspace">Reload Project</div>`;
+    return `<div class="dropdown-item" id="ctx-new-file">New File <span class="hotkey">Ctrl+N</span></div><div class="dropdown-item" id="ctx-fs-new-folder">New Folder</div>${this.copiedEntries.length ? '<div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-fs-paste">Paste File <span class="hotkey">Ctrl+V</span></div>' : ""}<div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-fs-reveal">Reveal Project in Explorer</div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-open-project">Open Project <span class="hotkey">Ctrl+O</span></div><div class="dropdown-separator"></div><div class="dropdown-item" id="ctx-restart-workspace">Reload Project</div>`;
   }
 
   private tabItems(): string {

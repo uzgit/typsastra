@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { history, undo } from "@codemirror/commands";
+import { history, redo, undo } from "@codemirror/commands";
 import {
   captureEditorUndoHistory,
   createTabEditorState,
+  externalEditorTextUpdate,
   type EditorUndoHistory,
 } from "../src/editor/tabHistory";
 
@@ -28,6 +29,17 @@ function edit(
 function undoState(state: ReturnType<typeof edit>) {
   let current = state;
   const applied = undo({
+    state: current,
+    dispatch: transaction => {
+      current = transaction.state;
+    },
+  });
+  return { applied, state: current };
+}
+
+function redoState(state: ReturnType<typeof edit>) {
+  let current = state;
+  const applied = redo({
     state: current,
     dispatch: transaction => {
       current = transaction.state;
@@ -72,6 +84,23 @@ describe("per-tab editor history", () => {
       extensions: history(),
     });
     expect(undoState(state).applied).toBe(false);
+  });
+
+  test("stores an external disk revision as an isolated undo and redo step", () => {
+    const edited = edit("saved", " local");
+    const externallyUpdated = externalEditorTextUpdate(edited, "external").state;
+
+    const restoredLocal = undoState(externallyUpdated);
+    expect(restoredLocal.applied).toBe(true);
+    expect(restoredLocal.state.doc.toString()).toBe("saved local");
+
+    const restoredExternal = redoState(restoredLocal.state);
+    expect(restoredExternal.applied).toBe(true);
+    expect(restoredExternal.state.doc.toString()).toBe("external");
+
+    const restoredSaved = undoState(undoState(restoredExternal.state).state);
+    expect(restoredSaved.applied).toBe(true);
+    expect(restoredSaved.state.doc.toString()).toBe("saved");
   });
 
   test("the workspace captures and restores history at tab boundaries", async () => {

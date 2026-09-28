@@ -9,7 +9,7 @@
     <body>
         <div id="app-shell">
             <div data-tauri-drag-region class="titlebar">
-                <div class="titlebar-left">
+                <div class="titlebar-left" data-tauri-drag-region>
                     <img
                         src="/assets/typsastra-favicon.png"
                         class="titlebar-icon"
@@ -217,7 +217,7 @@
                 <div class="titlebar-center" data-tauri-drag-region>
                     <div class="titlebar-text">Typsastra</div>
                 </div>
-                <div class="titlebar-right">
+                <div class="titlebar-right" data-tauri-drag-region>
                     <button
                         type="button"
                         id="app-update-badge"
@@ -1634,6 +1634,9 @@
                 -->
                             </div>
                         </div>
+                        <div class="editor-template-strip-row" aria-label="Insertion templates">
+                            <div id="editor-template-strip" class="editor-template-strip" role="toolbar" aria-label="Insertion templates"></div>
+                        </div>
                         <div
                             id="code-editor-pane"
                             class="input-pane"
@@ -1659,9 +1662,21 @@
                                 </button>
                             </div>
                             <div id="code-render-pane"></div>
-                            <div id="image-viewer-pane" class="hidden" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:auto;background:var(--ui-bg);padding:20px;box-sizing:border-box;">
-                                <img id="image-viewer-img" src="" alt="" style="max-width:100%;max-height:calc(100% - 60px);object-fit:contain;border-radius:4px;box-shadow:0 2px 12px rgba(0,0,0,0.12);" />
-                                <div id="image-viewer-info" style="margin-top:12px;font-size:12px;font-family:var(--font-family-sans);color:var(--ui-header-text);text-align:center;"></div>
+                            <div id="image-viewer-pane" class="hidden editor-file-viewer">
+                                <div id="editor-file-viewer-toolbar" class="editor-file-viewer-toolbar hidden">
+                                    <span id="editor-file-viewer-name" class="editor-file-viewer-name"></span>
+                                    <span id="editor-file-viewer-page" class="editor-file-viewer-page"></span>
+                                    <button id="editor-file-zoom-out" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+                                    <button id="editor-file-zoom-fit" type="button" title="Fit to pane">Fit</button>
+                                    <span id="editor-file-zoom-label" class="editor-file-viewer-zoom">Fit</span>
+                                    <button id="editor-file-zoom-in" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+                                    <button id="editor-file-open-external" type="button">Open Externally</button>
+                                </div>
+                                <div id="editor-file-pdf-surface" class="editor-file-viewer-surface hidden"></div>
+                                <div id="editor-file-image-surface" class="editor-file-viewer-surface hidden">
+                                    <img id="image-viewer-img" src="" alt="" draggable="false" />
+                                </div>
+                                <div id="image-viewer-info" class="editor-file-viewer-info"></div>
                             </div>
                         </div>
                         <!-- WYSIWYM editor pane disabled for this release.
@@ -2472,6 +2487,30 @@
                                     ></span
                                 ></label
                             >
+                            <label class="settings-toggle">
+                                <input id="settings-keep-main-preview" type="checkbox" />
+                                <span><strong>Keep preview on main file</strong><small>When a main file is configured, selecting another project file keeps the PDF preview on that main document.</small></span>
+                            </label>
+                            <label class="settings-toggle">
+                                <input id="settings-project-path-completion" type="checkbox" />
+                                <span><strong>Project path suggestions</strong><small>Suggest project files while typing paths in include, import, image, bibliography, and data-loading expressions.</small></span>
+                            </label>
+                            <label class="settings-toggle">
+                                <input id="settings-file-drop-import" type="checkbox" />
+                                <span><strong>Import dropped files</strong><small>Copy supported images and PDF documents dropped into the source editor, then insert the matching Typst expression.</small></span>
+                            </label>
+                            <label class="settings-toggle"><input id="settings-file-drop-create-figures" type="checkbox" /><span><strong>Create figures from dropped files</strong><small>Rename dropped images and PDFs with the local date and insert them through the shared Figure template. Toggle with Ctrl/Cmd+Shift+D.</small></span></label>
+                            <div class="settings-field settings-template-library"><div class="settings-template-heading"><label for="settings-template-scope">Insertion templates</label><select id="settings-template-scope"><option value="global">Global</option><option value="project">Project</option></select></div><small>Enabled templates appear as one-click items below the formatting toolbar. Project entries override global entries and are shared in <code>.typsastra/config.json</code>.</small><div id="settings-template-list" class="settings-template-list" aria-label="Insertion templates"></div><div class="settings-template-actions"><button id="settings-template-add" class="settings-secondary-button" type="button">Add template</button><button id="settings-template-up" class="settings-secondary-button" type="button">Move up</button><button id="settings-template-down" class="settings-secondary-button" type="button">Move down</button><button id="settings-template-delete" class="settings-secondary-button" type="button">Delete custom</button></div><div class="settings-field"><label for="settings-template-name">Template name</label><input id="settings-template-name" type="text" maxlength="100" /></div><label class="settings-toggle settings-template-enabled"><input id="settings-template-enabled" type="checkbox" /><span><strong>Enabled</strong><small>Show this template in the one-click strip.</small></span></label><div class="settings-field"><label for="settings-template-body">Template body</label><textarea id="settings-template-body" rows="12" spellcheck="false"></textarea><small>Placeholders: <code>{{select:text}}</code>, <code>{{cursor}}</code>, <code>{{filePath}}</code>, and <code>{{fileLabel}}</code>. Explicit single-line package imports are moved to the document prologue and de-duplicated.</small></div><div id="settings-template-warning" class="settings-template-warning" role="status" aria-live="polite"></div><div class="settings-template-actions"><button id="settings-template-reset-entry" class="settings-secondary-button" type="button">Reset entry</button><button id="settings-template-reset-scope" class="settings-secondary-button" type="button">Reset scope</button></div></div>
+                            <div class="settings-field">
+                                <label for="settings-file-drop-image-directory">Dropped image directory</label>
+                                <input id="settings-file-drop-image-directory" type="text" placeholder="Same directory as active file" autocomplete="off" spellcheck="false" />
+                                <small>Optional project-relative directory, such as <code>assets/images</code>.</small>
+                            </div>
+                            <div class="settings-field">
+                                <label for="settings-file-drop-document-directory">Dropped document directory</label>
+                                <input id="settings-file-drop-document-directory" type="text" placeholder="Same directory as active file" autocomplete="off" spellcheck="false" />
+                                <small>Optional project-relative directory, such as <code>documents</code>.</small>
+                            </div>
                             <div class="settings-field">
                                 <label>Language providers</label>
                                 <div class="settings-language-tools">
@@ -2569,6 +2608,19 @@
                                     >Stored per project. On type updates the PDF preview after typing pauses. On save minimizes background compilation.</small
                                 >
                             </div>
+                            <div class="settings-field">
+                                <label for="settings-preview-quality"
+                                    >Preview quality</label
+                                >
+                                <select id="settings-preview-quality">
+                                    <option value="memory-saver">Memory saver</option>
+                                    <option value="balanced">Balanced</option>
+                                    <option value="maximum">Maximum clarity</option>
+                                </select>
+                                <small
+                                    >Controls PDF canvas resolution. Balanced follows the display scale; Maximum clarity adds supersampling; Memory saver limits canvas memory.</small
+                                >
+                            </div>
                             <!-- TODO: Re-enable in prerelease v0.9.0 after improving performance and timeout reliability -->
                             <!--
                             <label class="settings-toggle"
@@ -2615,6 +2667,23 @@
                                 <small
                                     >Delay after the latest edit before an
                                     on-type preview update starts.</small
+                                >
+                            </div>
+                            <div class="settings-field">
+                                <label for="settings-on-type-rate-limit"
+                                    >On-type preview rate limit</label
+                                >
+                                <input
+                                    id="settings-on-type-rate-limit"
+                                    type="number"
+                                    min="1"
+                                    step="1"
+                                    placeholder="None"
+                                />
+                                <small
+                                    >Optional minimum number of seconds between
+                                    automatic preview updates. Leave blank for
+                                    no rate limit.</small
                                 >
                             </div>
                             <div class="settings-field">

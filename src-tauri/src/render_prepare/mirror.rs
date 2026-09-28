@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
@@ -67,6 +67,22 @@ pub struct RenderPrepareOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RenderPrepareOverlay {
+    pub file_path: PathBuf,
+    pub source_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderPreparedOverlay {
+    pub source_path: PathBuf,
+    pub generated_path: PathBuf,
+    pub prepared_text: String,
+    pub draft_cache_hit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RenderPrepareResult {
     pub generated_entry_file: PathBuf,
     pub changed_files: Vec<PathBuf>,
@@ -75,6 +91,9 @@ pub struct RenderPrepareResult {
     pub draft_diagnostics: Vec<DraftImageDiagnostic>,
     pub draft_cache_hits: usize,
     pub draft_reachable_files: Vec<PathBuf>,
+    pub dependency_files: Vec<PathBuf>,
+    pub dependency_manifest_complete: bool,
+    pub prepared_overlays: Vec<RenderPreparedOverlay>,
     pub timings: RenderPrepareTimings,
 }
 
@@ -240,6 +259,9 @@ pub fn mirror_project_cancellable(
         draft_assets,
         draft_diagnostics,
         draft_cache_hits,
+        dependency_files: draft_reachable_files.clone(),
+        dependency_manifest_complete: true,
+        prepared_overlays: Vec::new(),
         draft_reachable_files,
         timings: RenderPrepareTimings {
             total_ms: total_started_at.elapsed().as_secs_f64() * 1_000.0,
@@ -253,6 +275,86 @@ pub fn mirror_project_cancellable(
             asset_files,
         },
     })
+}
+
+pub fn apply_render_overlays_and_collect_dependencies(
+    options: &RenderPrepareOptions,
+    segmenter: Option<&KhmerTextSegmenter>,
+    overlays: &[RenderPrepareOverlay],
+    result: &mut RenderPrepareResult,
+) -> Result<(), String> {
+    let project_root = normalized_dependency_path(&options.project_root);
+    let render_dir = options.cache_root.join("render");
+    let mut overlay_sources = HashMap::new();
+
+    for overlay in overlays {
+        let source_path = normalized_dependency_path(&overlay.file_path);
+        if !source_path.starts_with(&project_root) {
+            return Err(outside_workspace_dependency_error(
+                &project_root,
+                &source_path,
+                &source_path,
+            ));
+        }
+        overlay_sources.insert(source_path.clone(), overlay.source_text.clone());
+
+        let relative = source_path
+            .strip_prefix(&project_root)
+            .map_err(|_| "Overlay path is outside the current workspace.".to_string())?;
+        let generated_path = render_dir.join(relative);
+        let is_typst = source_path.extension().and_then(|value| value.to_str()) == Some("typ");
+        let (prepared_text, draft_cache_hit) = if is_typst {
+            let prepared = prepare_single_in_memory_file(
+                options,
+                segmenter,
+                &source_path,
+                &overlay.source_text,
+            )?;
+            if prepared.draft_cache_hit {
+                result.draft_cache_hits += 1;
+            }
+            merge_draft_assets(&mut result.draft_assets, prepared.draft.assets);
+            result.draft_diagnostics.extend(prepared.draft.diagnostics);
+            (prepared.prepared_text, prepared.draft_cache_hit)
+        } else {
+            if let Some(parent) = generated_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            // Assets in the render mirror can be hard-linked to their source.
+            // Break that link before applying a text overlay so an unsaved
+            // editor buffer can never write through to the workspace file.
+            if fs::symlink_metadata(&generated_path).is_ok() {
+                fs::remove_file(&generated_path).map_err(|error| error.to_string())?;
+            }
+            fs::write(&generated_path, &overlay.source_text).map_err(|error| error.to_string())?;
+            (overlay.source_text.clone(), false)
+        };
+
+        result.changed_files.push(generated_path.clone());
+        result.prepared_overlays.push(RenderPreparedOverlay {
+            source_path,
+            generated_path,
+            prepared_text,
+            draft_cache_hit,
+        });
+    }
+
+    result.changed_files.sort();
+    result.changed_files.dedup();
+    let manifest = super::dependencies::collect_dependency_manifest(
+        &project_root,
+        &options.entry_file,
+        &overlay_sources,
+    );
+    result.dependency_files = manifest.paths;
+    result.dependency_manifest_complete = manifest.complete;
+    result.draft_reachable_files = result
+        .dependency_files
+        .iter()
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("typ"))
+        .cloned()
+        .collect();
+    Ok(())
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -1189,6 +1291,45 @@ mod tests {
 
         assert!(error.contains("outside the current workspace"));
         assert!(!cache_root.exists());
+    }
+
+    #[test]
+    fn text_resource_overlay_never_writes_through_to_the_workspace_source() {
+        let workspace = tempfile::tempdir().unwrap();
+        let main = workspace.path().join("main.typ");
+        let data = workspace.path().join("data.csv");
+        let cache_root = workspace.path().join(".typsastra/cache");
+        fs::write(&main, "#read(\"data.csv\")").unwrap();
+        fs::write(&data, "saved").unwrap();
+        let options = RenderPrepareOptions {
+            enable_khmer_zws: false,
+            project_root: workspace.path().to_path_buf(),
+            entry_file: main,
+            cache_root: cache_root.clone(),
+            generate_source_map: true,
+            preview_content_mode: PreviewContentMode::Normal,
+        };
+        let mut result = mirror_project_cancellable(&options, None, || false).unwrap();
+
+        apply_render_overlays_and_collect_dependencies(
+            &options,
+            None,
+            &[RenderPrepareOverlay {
+                file_path: data.clone(),
+                source_text: "unsaved".to_string(),
+            }],
+            &mut result,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&data).unwrap(), "saved");
+        assert_eq!(
+            fs::read_to_string(cache_root.join("render/data.csv")).unwrap(),
+            "unsaved"
+        );
+        assert!(result
+            .dependency_files
+            .contains(&canonical_or_original(&data)));
     }
 
     #[test]

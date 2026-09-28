@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { inlineCreationPlacement, isHiddenWorkspaceEntry, sortFileNodes, workspaceParentDirectories, workspacePathSetContains, type FileNode } from "../src/components/explorer";
+import { inlineCreationPlacement, isHiddenWorkspaceEntry, sortFileNodes, topLevelExplorerSelections, workspaceParentDirectories, workspacePathSetContains, type FileNode } from "../src/components/explorer";
 import { duplicateFileName, explorerKeyboardAction, isMainFileCandidate } from "../src/components/contextMenuController";
 
 describe("workspace explorer", () => {
@@ -77,8 +77,8 @@ describe("workspace explorer", () => {
     expect(isMainFileCandidate("/research/notes.typ", true)).toBe(false);
 
     const source = await Bun.file(new URL("../src/components/contextMenuController.ts", import.meta.url)).text();
-    expect(source).toContain("const mainAction = this.mainFileItem()");
-    expect(source).toContain("`${this.mainFileItem()}<div");
+    expect(source).toContain("const mainAction = single ? this.mainFileItem() :");
+    expect(source).toContain("this.explorerSelections().length");
   });
 
   test("gives explorer and tab targets precedence over text selected elsewhere", async () => {
@@ -92,6 +92,17 @@ describe("workspace explorer", () => {
     expect(explorerTarget).toBeGreaterThan(handler);
     expect(tabTarget).toBeGreaterThan(explorerTarget);
     expect(browserSelection).toBeGreaterThan(tabTarget);
+  });
+
+  test("prunes descendants from multi-item filesystem operations", () => {
+    expect(topLevelExplorerSelections([
+      { path: "/project/chapters", isDirectory: true },
+      { path: "/project/chapters/one.typ", isDirectory: false },
+      { path: "/project/images/cover.png", isDirectory: false },
+    ])).toEqual([
+      { path: "/project/chapters", isDirectory: true },
+      { path: "/project/images/cover.png", isDirectory: false },
+    ]);
   });
 
   test("derives editable duplicate names without losing extensions", () => {

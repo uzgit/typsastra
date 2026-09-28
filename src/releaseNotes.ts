@@ -6,6 +6,17 @@ export type ReleaseSummary = {
 };
 
 const releaseSummaries: Record<string, ReleaseSummary> = {
+  "0.6.2": {
+    version: "0.6.2",
+    title: "Safer project editing and configurable previews",
+    highlights: [
+      "External file revisions are accepted into editor history, while dirty buffers are recovered after an interrupted session.",
+      "On-type preview updates can be rate-limited, and preview canvas quality can be tuned for memory use or maximum clarity.",
+      "Project path completion, structured file drops, insertion templates, and moved-reference updates streamline multi-file work.",
+      "Image and PDF viewing, Draft Preview dependency handling, and workspace file operations are more robust."
+    ],
+    detailsUrl: "https://github.com/Sovichea/typsastra/releases/tag/v0.6.2"
+  },
   "0.6.1": {
     version: "0.6.1",
     title: "Lower-memory PDF loading",

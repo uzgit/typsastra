@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { PreviewRenderMode, TerminologyEntry } from "../settings";
+import { normalizeInsertionTemplateLayer, type InsertionTemplateLayer } from "../editor/insertionTemplates";
 
 export type StoredWorkspaceToolchain = {
   tinymistVersion: string;
@@ -21,6 +22,7 @@ export type StoredProjectState = {
   projectId: string;
   mainFile: string | null;
   recommendedToolchain: StoredWorkspaceToolchain | null;
+  insertionTemplates: InsertionTemplateLayer;
   terminology: TerminologyEntry[];
 };
 
@@ -113,7 +115,8 @@ export function normalizeWorkspaceMetadata(
         : createProjectId(),
       mainFile: safeRelativeWorkspacePath(project.mainFile),
       recommendedToolchain: toolchainOrNull(project.recommendedToolchain),
-      terminology: normalizeProjectTerminology(project.terminology)
+      terminology: normalizeProjectTerminology(project.terminology),
+      insertionTemplates: normalizeInsertionTemplateLayer(project.insertionTemplates)
     },
     workspace: {
       schemaVersion: 2,

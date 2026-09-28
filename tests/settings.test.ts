@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { cloneDefaultAppSettings, defaultAppSettings, normalizeAppSettings } from "../src/settings";
+import { cloneDefaultAppSettings, defaultAppSettings, normalizeAppSettings, normalizeProjectRelativeDirectory } from "../src/settings";
 
 describe("application settings", () => {
   test("fills missing values from defaults", () => {
     const settings = normalizeAppSettings({ appearance: { theme: "nord" } });
 
     expect(settings.appearance.theme).toBe("nord");
+    expect(settings.appearance.sidebarZoomPercent).toBe(100);
+    expect(settings.appearance.logZoomPercent).toBe(100);
+    expect(settings.appearance.fileViewerZoomPercent).toBeNull();
     expect(settings.developerMode).toBe(false);
     expect(settings.developerLogs).toEqual(defaultAppSettings.developerLogs);
     expect(settings.editor.codeFont).toBe("Fira Mono");
@@ -14,12 +17,19 @@ describe("application settings", () => {
     expect(settings.editor.wordWrap).toBe(defaultAppSettings.editor.wordWrap);
     expect(settings.editor.spellcheck).toBe(true);
     expect(settings.editor.wordCompletion).toBe(true);
+    expect(settings.editor.keepMainFilePreview).toBe(true);
+    expect(settings.editor.projectPathCompletion).toBe(true);
+    expect(settings.editor.fileDropImport).toBe(true);
+    expect(settings.editor.fileDropImageDirectory).toBe("");
+    expect(settings.editor.fileDropDocumentDirectory).toBe("");
     expect(settings.editor.showZws).toBe(true);
     expect(settings.editor.userDictionary).toEqual([]);
     expect(settings.editor.ignoredWords).toEqual([]);
     expect(settings.editor.formatOnSave).toBe(false);
     expect(settings.preview.renderMode).toBe("on-save");
+    expect(settings.preview.quality).toBe("balanced");
     expect(settings.preview.syncDebounceMs).toBe(defaultAppSettings.preview.syncDebounceMs);
+    expect(settings.preview.onTypeRateLimitSeconds).toBe(0);
     expect(settings.preview.forwardSyncTimeoutMs).toBe(5000);
     expect(settings.preview.khmerRenderPreparation).toBe(false);
     expect(settings.compatibility.disableWebkitDmabufRenderer).toBe(false);
@@ -30,11 +40,13 @@ describe("application settings", () => {
   test("rejects unsupported enums and clamps numeric values", () => {
     const settings = normalizeAppSettings({
       developerMode: true,
-      appearance: { theme: "unknown", editorFontSize: 80, editorLineHeight: 0.5 },
+      appearance: { theme: "unknown", editorFontSize: 80, editorLineHeight: 0.5, sidebarZoomPercent: 500, logZoomPercent: 1, fileViewerZoomPercent: 999 },
       editor: { tabSize: 3, codeFont: "MiSans Latin", unicodeFont: "unknown-font" },
       preview: {
         renderMode: "sometimes",
+        quality: "ultra",
         syncDebounceMs: 1,
+        onTypeRateLimitSeconds: -1,
         forwardSyncTimeoutMs: 50000,
         highlightDurationMs: 50000
       },
@@ -45,14 +57,19 @@ describe("application settings", () => {
     expect(settings.developerMode).toBe(true);
     expect(settings.appearance.editorFontSize).toBe(32);
     expect(settings.appearance.editorLineHeight).toBe(1.2);
+    expect(settings.appearance.sidebarZoomPercent).toBe(200);
+    expect(settings.appearance.logZoomPercent).toBe(75);
+    expect(settings.appearance.fileViewerZoomPercent).toBe(400);
     expect(settings.editor.tabSize).toBe(2);
     expect(settings.editor.codeFont).toBe("Fira Mono");
     expect(settings.editor.unicodeFont).toBe("unknown-font");
     expect(settings.editor.formatOnSave).toBe(false);
     expect(settings.preview.syncDebounceMs).toBe(50);
+    expect(settings.preview.onTypeRateLimitSeconds).toBe(0);
     expect(settings.preview.forwardSyncTimeoutMs).toBe(30000);
     expect(settings.preview.highlightDurationMs).toBe(10000);
     expect(settings.preview.renderMode).toBe("on-save");
+    expect(settings.preview.quality).toBe("balanced");
     expect(settings.toolchain.tinymistVersion).toBeNull();
   });
 
@@ -119,9 +136,38 @@ describe("application settings", () => {
     expect(second.developerLogs.memory).toBe(true);
   });
 
-  test("preserves both supported preview render modes", () => {
+  test("preserves supported preview render and quality modes", () => {
     expect(normalizeAppSettings({ preview: { renderMode: "on-save" } }).preview.renderMode).toBe("on-save");
     expect(normalizeAppSettings({ preview: { renderMode: "on-type" } }).preview.renderMode).toBe("on-type");
+    expect(normalizeAppSettings({ preview: { quality: "memory-saver" } }).preview.quality).toBe("memory-saver");
+    expect(normalizeAppSettings({ preview: { quality: "balanced" } }).preview.quality).toBe("balanced");
+    expect(normalizeAppSettings({ preview: { quality: "maximum" } }).preview.quality).toBe("maximum");
+  });
+
+  test("keeps an optional positive integer on-type preview rate limit", () => {
+    expect(normalizeAppSettings({ preview: { onTypeRateLimitSeconds: 7 } }).preview.onTypeRateLimitSeconds).toBe(7);
+    expect(normalizeAppSettings({ preview: { onTypeRateLimitSeconds: 1.6 } }).preview.onTypeRateLimitSeconds).toBe(2);
+    expect(normalizeAppSettings({ preview: { onTypeRateLimitSeconds: 0 } }).preview.onTypeRateLimitSeconds).toBe(0);
+  });
+
+  test("wires the on-type preview rate limit into Settings", async () => {
+    const html = await Bun.file(new URL("../index.html", import.meta.url)).text();
+    const controller = await Bun.file(new URL("../src/settingsController.ts", import.meta.url)).text();
+    expect(html).toContain('id="settings-on-type-rate-limit"');
+    expect(html).toContain('placeholder="None"');
+    expect(controller).toContain('onChange("settings-on-type-rate-limit"');
+    expect(controller).toContain('preview.onTypeRateLimitSeconds === 0 ? ""');
+  });
+
+  test("wires all preview quality options into Settings", async () => {
+    const html = await Bun.file(new URL("../index.html", import.meta.url)).text();
+    const controller = await Bun.file(new URL("../src/settingsController.ts", import.meta.url)).text();
+    expect(html).toContain('id="settings-preview-quality"');
+    expect(html).toContain('<option value="memory-saver">Memory saver</option>');
+    expect(html).toContain('<option value="balanced">Balanced</option>');
+    expect(html).toContain('<option value="maximum">Maximum clarity</option>');
+    expect(controller).toContain('onChange("settings-preview-quality"');
+    expect(controller).toContain('setValue("settings-preview-quality", preview.quality)');
   });
 
   test("keeps the Linux WebKit DMA-BUF compatibility override", () => {
@@ -162,5 +208,24 @@ describe("application settings", () => {
       editor: { ignoredWords: [" ខ្មេ ", "ខ្មេ", "", 42] }
     });
     expect(settings.editor.ignoredWords).toEqual(["ខ្មេ"]);
+  });
+  test("normalizes project-relative drop destinations", () => {
+    expect(normalizeProjectRelativeDirectory(" ./assets\\images/ ")).toBe("assets/images");
+    expect(normalizeProjectRelativeDirectory("documents/pdfs")).toBe("documents/pdfs");
+    expect(normalizeProjectRelativeDirectory("../outside")).toBe("");
+    expect(normalizeProjectRelativeDirectory("/absolute/path")).toBe("");
+    expect(normalizeAppSettings({ editor: {
+      keepMainFilePreview: false,
+      projectPathCompletion: false,
+      fileDropImport: false,
+      fileDropImageDirectory: "assets/images",
+      fileDropDocumentDirectory: "../outside"
+    } }).editor).toMatchObject({
+      keepMainFilePreview: false,
+      projectPathCompletion: false,
+      fileDropImport: false,
+      fileDropImageDirectory: "assets/images",
+      fileDropDocumentDirectory: ""
+    });
   });
 });

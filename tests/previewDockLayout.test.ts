@@ -7,11 +7,24 @@ describe("preview dock layout", () => {
     const app = await Bun.file(new URL("../src/appController.ts", import.meta.url)).text();
 
     expect(layout).toContain("private dockedInputWidthPct = 50");
-    expect(layout).toContain("this.captureDockedPaneSize();\n      previewWrapper.style.display = \"none\"");
+    expect(layout).toContain(
+      "this.captureDockedPaneSize();\n      this.previewUndocked = true;\n      previewWrapper.style.display = \"none\""
+    );
     expect(layout).toContain("input.style.width = `${this.dockedInputWidthPct}%`");
     expect(layout).toContain("previewWrapper.style.width = `${100 - this.dockedInputWidthPct}%`");
     expect(app).toContain("inputContainerWidthPct: this.layoutController.getDockedInputWidthPct()");
     expect(app).toContain("this.layoutController.setDockedInputWidthPct(state.layout.inputContainerWidthPct)");
+  });
+
+  test("keeps preview docking independent from editor tab activation", async () => {
+    const layout = await Bun.file(new URL("../src/layout/layoutController.ts", import.meta.url)).text();
+    const app = await Bun.file(new URL("../src/appController.ts", import.meta.url)).text();
+
+    expect(layout).toContain("private previewUndocked = false");
+    expect(layout).toContain("this.previewUndocked = true");
+    expect(layout).toContain("public isPreviewUndocked(): boolean");
+    expect(layout).toContain("this.previewUndocked = false");
+    expect(app).toContain("if (!this.layoutController.isPreviewUndocked())");
   });
 
   test("stops shrinking once the essential preview toolbar controls are packed", () => {

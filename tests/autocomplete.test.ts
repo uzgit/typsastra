@@ -20,6 +20,8 @@ import {
   normalizeCallableCompletionSnippet,
   preferContextualArgumentCompletions,
   quotedCompletionEditOffsets,
+  typstPathCompletionContext,
+  workspacePathMatchesKind,
   typstMemberCompletionValidFor,
   typstCompletionValidFor
 } from "../src/editor/autocomplete";
@@ -415,5 +417,40 @@ describe("segmented language completion", () => {
       to: 12,
       options: ["word"]
     })).toBeNull();
+  });
+});
+describe("project path completion", () => {
+  test("recognizes quoted and in-progress include paths", () => {
+    const unquoted = "#include ./";
+    expect(typstPathCompletionContext(unquoted, unquoted.length)).toEqual({
+      from: "#include ".length,
+      typedPath: "./",
+      kind: "include"
+    });
+    const quoted = '#include "./front_matter/';
+    expect(typstPathCompletionContext(quoted, quoted.length)?.typedPath).toBe("./front_matter/");
+  });
+
+  test("recognizes image and data-loading strings", () => {
+    const image = '#image("./assets/';
+    expect(typstPathCompletionContext(image, image.length)?.kind).toBe("image");
+    const csv = '#csv("./data/';
+    expect(typstPathCompletionContext(csv, csv.length)?.kind).toBe("data");
+  });
+
+  test("filters files by Typst expression kind while retaining directories", () => {
+    const title = { path: "./front_matter/title_page.typ", isDirectory: false };
+    const image = { path: "./images/cover.png", isDirectory: false };
+    const directory = { path: "./images/", isDirectory: true };
+    expect(workspacePathMatchesKind(title, "include")).toBe(true);
+    expect(workspacePathMatchesKind(image, "include")).toBe(false);
+    expect(workspacePathMatchesKind(image, "image")).toBe(true);
+    expect(workspacePathMatchesKind(directory, "import")).toBe(true);
+  });
+
+  test("lets Tab accept an open completion before indentation", async () => {
+    const source = await Bun.file(new URL("../src/editor/extensions.ts", import.meta.url)).text();
+    expect(source.indexOf('event.key === "Tab"')).toBeLessThan(source.indexOf('event.key === "Enter"'));
+    expect(source).toContain("handled = acceptCompletion(view)");
   });
 });

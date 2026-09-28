@@ -6,6 +6,14 @@ import { fileNameFromPath, filePathKey, relativeFilePath } from "../platform/pat
 export interface FileNode { name: string; path: string; isDirectory: boolean; children?: FileNode[]; }
 
 export type ExplorerSelection = { path: string; isDirectory: boolean };
+export type WorkspacePathTransfer = { sourcePath: string; destinationPath: string };
+
+export function topLevelExplorerSelections(entries: readonly ExplorerSelection[]): ExplorerSelection[] {
+  const normalized = entries.map(entry => ({ ...entry, key: filePathKey(entry.path).replace(/\\/g, "/") }));
+  return normalized.filter((entry, index) => !normalized.some((other, otherIndex) =>
+    index !== otherIndex && other.isDirectory && entry.key.startsWith(other.key.replace(/\/$/, "") + "/")
+  )).map(({ key: _key, ...entry }) => entry);
+}
 
 export function sortFileNodes(nodes: FileNode[]): FileNode[] {
   return [...nodes].sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.name.localeCompare(b.name));
@@ -66,12 +74,15 @@ export class WorkspaceExplorer {
   private loadGeneration = 0;
   private workspaceRootPath: string | null = null;
   private activeFilePath: string | null = null;
+  private selectionAnchorPath: string | null = null;
+  private dragExpandTimer: number | null = null;
 
   constructor(
     private container: HTMLElement,
     private onFileSelected: (filePath: string, options?: { temporary?: boolean; focusEditor?: boolean }) => void,
     private isPinnedMainFile?: (filePath: string) => boolean,
-    private titleElement?: HTMLElement
+    private titleElement?: HTMLElement,
+    private onEntriesMoved?: (transfers: WorkspacePathTransfer[]) => void | Promise<void>
   ) {
     this.container.tabIndex = 0;
     this.container.setAttribute("role", "tree");
@@ -83,12 +94,41 @@ export class WorkspaceExplorer {
     });
     this.container.addEventListener("focus", () => this.ensureKeyboardSelection());
     this.container.addEventListener("keydown", event => void this.handleKeyboardNavigation(event));
+    this.container.addEventListener("dragover", event => {
+      if ((event.target as HTMLElement).closest(".tree-item")) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      this.clearDropTargets();
+      this.container.classList.add("explorer-root-drop-target");
+    });
+    this.container.addEventListener("dragleave", event => {
+      if (!this.container.contains(event.relatedTarget as Node | null)) this.clearDropTargets();
+    });
+    this.container.addEventListener("drop", event => {
+      if ((event.target as HTMLElement).closest(".tree-item")) return;
+      event.preventDefault();
+      this.clearDropTargets();
+      if (this.workspaceRootPath) void this.moveSelectionTo(this.workspaceRootPath);
+    });
   }
 
   public selectedEntry(): ExplorerSelection | null {
     const item = this.container.querySelector<HTMLElement>(".tree-item.selected[data-path]");
     const path = item?.dataset.path;
     return path ? { path, isDirectory: item.dataset.isDir === "true" } : null;
+  }
+
+  public selectedEntries(): ExplorerSelection[] {
+    return this.visibleItems().filter(item => item.classList.contains("selected")).flatMap(item => {
+      const path = item.dataset.path;
+      return path ? [{ path, isDirectory: item.dataset.isDir === "true" }] : [];
+    });
+  }
+
+  public selectPath(path: string, preserveExisting = false): void {
+    const item = this.visibleItems().find(candidate => filePathKey(candidate.dataset.path ?? "") === filePathKey(path));
+    if (!item) return;
+    this.selectItem(item, preserveExisting);
   }
 
   public focus(): void {
@@ -101,14 +141,119 @@ export class WorkspaceExplorer {
       .filter(item => item.getClientRects().length > 0);
   }
 
-  private selectItem(item: HTMLElement): void {
+  private selectItem(item: HTMLElement, preserveExisting = false): void {
+    if (!preserveExisting) {
+      this.container.querySelectorAll<HTMLElement>(".tree-item.selected").forEach(current => {
+        current.classList.remove("selected");
+        current.setAttribute("aria-selected", "false");
+      });
+    }
+    item.classList.add("selected");
+    item.setAttribute("aria-selected", "true");
+    this.selectionAnchorPath = item.dataset.path ?? this.selectionAnchorPath;
+    item.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  private toggleItem(item: HTMLElement): void {
+    const selected = item.classList.toggle("selected");
+    item.setAttribute("aria-selected", String(selected));
+    this.selectionAnchorPath = item.dataset.path ?? this.selectionAnchorPath;
+  }
+
+  private selectRange(item: HTMLElement): void {
+    const items = this.visibleItems();
+    const anchor = items.find(candidate => filePathKey(candidate.dataset.path ?? "") === filePathKey(this.selectionAnchorPath ?? ""))
+      ?? this.container.querySelector<HTMLElement>(".tree-item.selected[data-path]")
+      ?? item;
+    const start = items.indexOf(anchor);
+    const end = items.indexOf(item);
     this.container.querySelectorAll<HTMLElement>(".tree-item.selected").forEach(current => {
       current.classList.remove("selected");
       current.setAttribute("aria-selected", "false");
     });
-    item.classList.add("selected");
-    item.setAttribute("aria-selected", "true");
+    for (const candidate of items.slice(Math.min(start, end), Math.max(start, end) + 1)) {
+      candidate.classList.add("selected");
+      candidate.setAttribute("aria-selected", "true");
+    }
     item.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  private handleSelectionClick(event: MouseEvent, item: HTMLElement): boolean {
+    if (event.shiftKey) {
+      this.selectRange(item);
+      return true;
+    }
+    if (event.ctrlKey || event.metaKey) {
+      this.toggleItem(item);
+      return true;
+    }
+    this.selectItem(item);
+    return false;
+  }
+
+  private clearDropTargets(): void {
+    if (this.dragExpandTimer !== null) window.clearTimeout(this.dragExpandTimer);
+    this.dragExpandTimer = null;
+    this.container.classList.remove("explorer-root-drop-target");
+    this.container.querySelectorAll(".explorer-drop-target").forEach(item => item.classList.remove("explorer-drop-target"));
+  }
+
+  private async moveSelectionTo(destinationDirectory: string): Promise<void> {
+    if (!this.onEntriesMoved) return;
+    const selections = topLevelExplorerSelections(this.selectedEntries());
+    const transfers = await Promise.all(selections.map(async entry => ({
+      sourcePath: entry.path,
+      destinationPath: await join(destinationDirectory, fileNameFromPath(entry.path)),
+    })));
+    const useful = transfers.filter(transfer => filePathKey(transfer.sourcePath) !== filePathKey(transfer.destinationPath));
+    if (useful.length > 0) {
+      try {
+        await this.onEntriesMoved(useful);
+      } catch (error) {
+        alert(`Nothing was moved: ${String(error)}`);
+      }
+    }
+  }
+
+  private installDragHandlers(label: HTMLElement, node: FileNode): void {
+    label.draggable = true;
+    label.addEventListener("dragstart", event => {
+      if (!label.classList.contains("selected")) this.selectItem(label);
+      const count = topLevelExplorerSelections(this.selectedEntries()).length;
+      label.classList.add("explorer-drag-source");
+      event.dataTransfer?.setData("text/x-typsastra-workspace-path", node.path);
+      event.dataTransfer?.setData("text/plain", node.path);
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+      if (count > 1) label.dataset.dragCount = String(count);
+    });
+    label.addEventListener("dragend", () => {
+      delete label.dataset.dragCount;
+      this.container.querySelectorAll(".explorer-drag-source").forEach(item => item.classList.remove("explorer-drag-source"));
+      this.clearDropTargets();
+    });
+    if (!node.isDirectory) return;
+    label.addEventListener("dragover", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.clearDropTargets();
+      label.classList.add("explorer-drop-target");
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      const folder = label.closest("li.tree-folder");
+      if (folder?.classList.contains("collapsed")) {
+        this.dragExpandTimer = window.setTimeout(() => {
+          if (!folder.classList.contains("collapsed")) return;
+          const selected = this.selectedEntries();
+          label.click();
+          selected.forEach((entry, index) => this.selectPath(entry.path, index > 0));
+        }, 600);
+      }
+    });
+    label.addEventListener("drop", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.clearDropTargets();
+      void this.moveSelectionTo(node.path);
+    });
   }
 
   private ensureKeyboardSelection(): void {
@@ -129,10 +274,10 @@ export class WorkspaceExplorer {
     event.stopPropagation();
 
     const index = Math.max(0, items.indexOf(selected));
-    if (event.key === "ArrowUp") this.selectItem(items[Math.max(0, index - 1)]);
-    else if (event.key === "ArrowDown") this.selectItem(items[Math.min(items.length - 1, index + 1)]);
-    else if (event.key === "Home") this.selectItem(items[0]);
-    else if (event.key === "End") this.selectItem(items[items.length - 1]);
+    if (event.key === "ArrowUp") event.shiftKey ? this.selectRange(items[Math.max(0, index - 1)]) : this.selectItem(items[Math.max(0, index - 1)]);
+    else if (event.key === "ArrowDown") event.shiftKey ? this.selectRange(items[Math.min(items.length - 1, index + 1)]) : this.selectItem(items[Math.min(items.length - 1, index + 1)]);
+    else if (event.key === "Home") event.shiftKey ? this.selectRange(items[0]) : this.selectItem(items[0]);
+    else if (event.key === "End") event.shiftKey ? this.selectRange(items[items.length - 1]) : this.selectItem(items[items.length - 1]);
     else if (event.key === "Enter") {
       if (selected.dataset.isDir === "true") selected.click();
       else if (selected.dataset.path) this.onFileSelected(selected.dataset.path, { temporary: false, focusEditor: false });
@@ -187,7 +332,7 @@ export class WorkspaceExplorer {
       if (generation !== this.loadGeneration) return;
       this.container.innerHTML = "";
 
-      this.container.appendChild(this.renderTree(nodes, 0, viewState.expandedPaths, viewState.selectedPath));
+      this.container.appendChild(this.renderTree(nodes, 0, viewState.expandedPaths, viewState.selectedPaths));
     } catch {
       if (generation !== this.loadGeneration) return;
       this.container.innerHTML = `<div class="explorer-error">Access Refused.</div>`;
@@ -203,7 +348,7 @@ export class WorkspaceExplorer {
     for (const parent of parents) {
       viewState.expandedPaths.add(parent);
     }
-    viewState.selectedPath = targetPath;
+    viewState.selectedPaths = new Set([targetPath]);
 
     const generation = ++this.loadGeneration;
     try {
@@ -211,7 +356,7 @@ export class WorkspaceExplorer {
       await this.hydrateExpandedDirectories(nodes, viewState.expandedPaths);
       if (generation !== this.loadGeneration) return;
       this.container.innerHTML = "";
-      this.container.appendChild(this.renderTree(nodes, 0, viewState.expandedPaths, viewState.selectedPath));
+      this.container.appendChild(this.renderTree(nodes, 0, viewState.expandedPaths, viewState.selectedPaths));
 
       const targetKey = filePathKey(targetPath);
       const selectedEl = [...this.container.querySelectorAll<HTMLElement>(".tree-item[data-path]")]
@@ -224,14 +369,15 @@ export class WorkspaceExplorer {
     }
   }
 
-  private captureViewState(): { expandedPaths: Set<string>; selectedPath: string | null } {
+  private captureViewState(): { expandedPaths: Set<string>; selectedPaths: Set<string> } {
     const expandedPaths = new Set<string>();
     this.container.querySelectorAll<HTMLElement>(".tree-folder:not(.collapsed) > .tree-item[data-path]")
       .forEach(item => {
         if (item.dataset.path) expandedPaths.add(item.dataset.path);
       });
-    const selectedPath = this.container.querySelector<HTMLElement>(".tree-item.selected[data-path]")?.dataset.path ?? null;
-    return { expandedPaths, selectedPath };
+    const selectedPaths = new Set([...this.container.querySelectorAll<HTMLElement>(".tree-item.selected[data-path]")]
+      .flatMap(item => item.dataset.path ? [item.dataset.path] : []));
+    return { expandedPaths, selectedPaths };
   }
 
   private async hydrateExpandedDirectories(nodes: FileNode[], expandedPaths: Set<string>): Promise<void> {
@@ -268,7 +414,7 @@ export class WorkspaceExplorer {
     nodes: FileNode[],
     depth: number = 0,
     expandedPaths: Set<string> = new Set(),
-    selectedPath: string | null = null
+    selectedPaths: ReadonlySet<string> = new Set()
   ): DocumentFragment {
     const fragment = document.createDocumentFragment();
     const ul = document.createElement("ul");
@@ -284,7 +430,7 @@ export class WorkspaceExplorer {
       const isActiveFile = !node.isDirectory
         && this.activeFilePath !== null
         && filePathKey(this.activeFilePath) === filePathKey(node.path);
-      const isSelected = selectedPath !== null && filePathKey(selectedPath) === filePathKey(node.path);
+      const isSelected = workspacePathSetContains(selectedPaths, node.path);
       label.className = `tree-item explorer-item-target${isSelected ? " selected" : ""}${isActiveFile ? " active-file" : ""}${isPinnedMain ? " pinned-main" : ""}`;
       label.dataset.path = node.path;
       label.dataset.isDir = String(node.isDirectory);
@@ -321,10 +467,9 @@ export class WorkspaceExplorer {
       label.appendChild(textContainer);
 
       if (!node.isDirectory) {
-        label.addEventListener("click", () => {
-          this.container.querySelectorAll('.tree-item.selected').forEach(el => el.classList.remove('selected'));
-          label.classList.add('selected');
-          this.onFileSelected(node.path, { temporary: true, focusEditor: false });
+        label.addEventListener("click", event => {
+          const selectionOnly = this.handleSelectionClick(event, label);
+          if (!selectionOnly) this.onFileSelected(node.path, { temporary: true, focusEditor: false });
         });
         label.addEventListener("dblclick", () => {
           this.onFileSelected(node.path, { temporary: false, focusEditor: false });
@@ -335,12 +480,12 @@ export class WorkspaceExplorer {
         let loading = false;
 
         if (node.children) {
-          childrenContainer.appendChild(this.renderTree(node.children, depth + 1, expandedPaths, selectedPath));
+          childrenContainer.appendChild(this.renderTree(node.children, depth + 1, expandedPaths, selectedPaths));
         }
 
-        label.addEventListener("click", async () => {
-          this.container.querySelectorAll(".tree-item.selected").forEach(item => item.classList.remove("selected"));
-          label.classList.add("selected");
+        label.addEventListener("click", async event => {
+          const selectionOnly = this.handleSelectionClick(event, label);
+          if (selectionOnly) return;
           const expanding = li.classList.contains("collapsed");
           li.classList.toggle("collapsed", !expanding);
           chevronContainer.classList.toggle("collapsed", !expanding);
@@ -351,7 +496,7 @@ export class WorkspaceExplorer {
           label.classList.add("loading");
           try {
             node.children = await this.readDirectory(node.path);
-            childrenContainer.replaceChildren(this.renderTree(node.children, depth + 1, expandedPaths, selectedPath));
+            childrenContainer.replaceChildren(this.renderTree(node.children, depth + 1, expandedPaths, selectedPaths));
           } catch {
             const error = document.createElement("div");
             error.className = "explorer-error";
@@ -366,6 +511,7 @@ export class WorkspaceExplorer {
         li.appendChild(childrenContainer);
       }
 
+      this.installDragHandlers(label, node);
       li.insertBefore(label, li.firstChild);
       ul.appendChild(li);
     }

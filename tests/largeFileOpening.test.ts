@@ -69,28 +69,19 @@ describe("large file opening notice", () => {
     expect(formatFileSize(100 * 1024 * 1024)).toBe("100 MB");
   });
 
-  test("keeps standalone PDF confirmation in the preview pane", async () => {
+  test("keeps standalone PDF confirmation in the central editor viewer", async () => {
     const controller = await Bun.file(new URL("../src/appController.ts", import.meta.url)).text();
     const confirmationStart = controller.indexOf("private showLargeFileConfirmation");
     const confirmationEnd = controller.indexOf("private async openFileExternally", confirmationStart);
     const confirmationSource = controller.slice(confirmationStart, confirmationEnd);
 
     expect(confirmationSource).toContain('if (notice.kind === "pdf")');
+    expect(confirmationSource).toContain("this.prepareEditorFileViewer(path");
     expect(confirmationSource).toContain("this.blockedLargePdfPaths.add(filePathKey(path))");
-    expect(confirmationSource).toContain("this.pdfLoadRequestGeneration += 1");
-    expect(confirmationSource).toContain("this.invalidatePreviewWork(");
-    expect(confirmationSource).toContain("this.previewFrame.setConfirmationMessage({");
-    expect(confirmationSource).toContain("Large PDF Preview Not Started");
-    expect(confirmationSource).toContain('confirmLabel: "Open Large PDF"');
-    expect(confirmationSource).toContain('if (notice.kind === "pdf")');
+    expect(confirmationSource).not.toContain("this.previewFrame.setConfirmationMessage({");
+    expect(confirmationSource).not.toContain("this.invalidatePreviewWork(");
+    expect(confirmationSource).toContain('"Open Large PDF"');
     expect(confirmationSource).toContain("this.blockedLargePdfPaths.delete(filePathKey(path))");
-
-    const loadStart = controller.indexOf("private async loadPdfPath");
-    const loadEnd = controller.indexOf("private async closePreparedPreviewDocuments", loadStart);
-    const loadSource = controller.slice(loadStart, loadEnd);
-    expect(loadSource).toContain("if (this.blockedLargePdfPaths.has(pathKey)) return 0");
-    expect(loadSource).toContain("const requestGeneration = ++this.pdfLoadRequestGeneration");
-    expect(loadSource).toContain("this.blockedLargePdfPaths.has(pathKey)");
   });
 
   test("routes large Typst preview approval through the editor guard", async () => {

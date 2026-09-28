@@ -48,6 +48,23 @@ describe("workspace watcher", () => {
     ]);
   });
 
+  test("accepts changed dirty text through an undoable external editor revision", async () => {
+    const source = await Bun.file(new URL("../src/appController.ts", import.meta.url)).text();
+    const reloadStart = source.indexOf("private async reloadOpenFilesFromDisk");
+    const reloadEnd = source.indexOf("private async applyExternalFileContent", reloadStart);
+    const reload = source.slice(reloadStart, reloadEnd);
+    const applyEnd = source.indexOf("private currentPreviewCompilationRoot", reloadEnd);
+    const apply = source.slice(reloadEnd, applyEnd);
+
+    expect(reload).toContain("this.flushEditorContentMutation()");
+    expect(reload).not.toContain('reportExternalConflict(tab.path, "changed outside Typsastra")');
+    expect(apply).toContain("externalEditorTextUpdate(this.editorInstance.state, contents)");
+    expect(apply).toContain("tab.undoHistory = captureEditorUndoHistory");
+    expect(apply).toContain("this.clearPendingLspSync()");
+    expect(apply).toContain('this.invalidatePreviewWork("external file revision")');
+    expect(apply).toContain("await this.closeDocumentIfOpened(tab.path)");
+  });
+
   test("excludes application-managed preview outputs from workspace changes", () => {
     const paths = [
       "C:\\Project\\main.pdf",

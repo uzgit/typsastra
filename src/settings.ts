@@ -13,6 +13,7 @@ export const themeNames = [
 
 export type ThemeName = typeof themeNames[number];
 export type PreviewRenderMode = "on-type" | "on-save";
+export type { PreviewQualityMode };
 export type DeveloperLogCategory =
   | "preview"
   | "inverseSync"
@@ -36,6 +37,9 @@ export type AppSettings = {
     theme: ThemeName;
     editorFontSize: number;
     editorLineHeight: number;
+    sidebarZoomPercent: number;
+    logZoomPercent: number;
+    fileViewerZoomPercent: number | null;
   };
   editor: {
     codeFont: CodeEditorFontId;
@@ -49,6 +53,13 @@ export type AppSettings = {
     indentationGuides: boolean;
     spellcheck: boolean;
     wordCompletion: boolean;
+    keepMainFilePreview: boolean;
+    projectPathCompletion: boolean;
+    fileDropImport: boolean;
+    fileDropCreateFigures: boolean;
+    fileDropImageDirectory: string;
+    fileDropDocumentDirectory: string;
+    insertionTemplates: import("./editor/insertionTemplates").InsertionTemplateLayer;
     showZws: boolean;
     userDictionary: string[];
     ignoredWords: string[];
@@ -59,8 +70,10 @@ export type AppSettings = {
   };
   preview: {
     renderMode: PreviewRenderMode;
+    quality: PreviewQualityMode;
     cursorSync: boolean;
     syncDebounceMs: number;
+    onTypeRateLimitSeconds: number;
     forwardSyncTimeoutMs: number;
     highlightDurationMs: number;
     khmerRenderPreparation: boolean;
@@ -92,7 +105,10 @@ export const defaultAppSettings: AppSettings = {
   appearance: {
     theme: "default",
     editorFontSize: 14,
-    editorLineHeight: 1.7
+    editorLineHeight: 1.7,
+    sidebarZoomPercent: 100,
+    logZoomPercent: 100,
+    fileViewerZoomPercent: null
   },
   editor: {
     codeFont: "Fira Mono",
@@ -106,6 +122,13 @@ export const defaultAppSettings: AppSettings = {
     indentationGuides: true,
     spellcheck: true,
     wordCompletion: true,
+    keepMainFilePreview: true,
+    projectPathCompletion: true,
+    fileDropImport: true,
+    fileDropCreateFigures: false,
+    fileDropImageDirectory: "",
+    fileDropDocumentDirectory: "",
+    insertionTemplates: { order: [], disabled: [], overrides: {}, custom: [] },
     showZws: true,
     userDictionary: [],
     ignoredWords: [],
@@ -116,10 +139,12 @@ export const defaultAppSettings: AppSettings = {
   },
   preview: {
     renderMode: "on-save",
+    quality: "balanced",
     // TODO: Re-enable in prerelease v0.9.0 after improving performance and timeout reliability
     // cursorSync: true,
     cursorSync: false,
     syncDebounceMs: 500,
+    onTypeRateLimitSeconds: 0,
     forwardSyncTimeoutMs: 5000,
     highlightDurationMs: 2200,
     khmerRenderPreparation: false
@@ -145,6 +170,12 @@ function boundedNumber(value: unknown, fallback: number, min: number, max: numbe
   return typeof value === "number" && Number.isFinite(value)
     ? Math.min(max, Math.max(min, value))
     : fallback;
+}
+
+function optionalPositiveInteger(value: unknown, fallback: number): number {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(Math.round(value), Math.floor(Number.MAX_SAFE_INTEGER / 1_000));
 }
 
 function booleanValue(value: unknown, fallback: boolean): boolean {
@@ -221,6 +252,16 @@ function privateFontDirectories(value: unknown): string[] {
   return directories.slice(0, 32);
 }
 
+export function normalizeProjectRelativeDirectory(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  if (!normalized) return "";
+  if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) return "";
+  const components = normalized.split("/").filter(component => component.length > 0 && component !== ".");
+  if (components.some(component => component === ".." || component.includes("\0"))) return "";
+  return components.join("/");
+}
+
 export function normalizeAppSettings(value: unknown): AppSettings {
   const root = objectValue(value);
   const appearance = objectValue(root.appearance);
@@ -253,7 +294,12 @@ export function normalizeAppSettings(value: unknown): AppSettings {
     appearance: {
       theme,
       editorFontSize: boundedNumber(appearance.editorFontSize, defaultAppSettings.appearance.editorFontSize, 10, 32),
-      editorLineHeight: boundedNumber(appearance.editorLineHeight, defaultAppSettings.appearance.editorLineHeight, 1.2, 2.4)
+      editorLineHeight: boundedNumber(appearance.editorLineHeight, defaultAppSettings.appearance.editorLineHeight, 1.2, 2.4),
+      sidebarZoomPercent: Math.round(boundedNumber(appearance.sidebarZoomPercent, defaultAppSettings.appearance.sidebarZoomPercent, 75, 200)),
+      logZoomPercent: Math.round(boundedNumber(appearance.logZoomPercent, defaultAppSettings.appearance.logZoomPercent, 75, 200)),
+      fileViewerZoomPercent: appearance.fileViewerZoomPercent === null || appearance.fileViewerZoomPercent === undefined
+        ? null
+        : Math.round(boundedNumber(appearance.fileViewerZoomPercent, 100, 10, 400))
     },
     editor: {
       codeFont: normalizeCodeEditorFont(editor.codeFont),
@@ -267,6 +313,13 @@ export function normalizeAppSettings(value: unknown): AppSettings {
       indentationGuides: booleanValue(editor.indentationGuides, defaultAppSettings.editor.indentationGuides),
       spellcheck: booleanValue(editor.spellcheck, defaultAppSettings.editor.spellcheck),
       wordCompletion: booleanValue(editor.wordCompletion, defaultAppSettings.editor.wordCompletion),
+      keepMainFilePreview: booleanValue(editor.keepMainFilePreview, defaultAppSettings.editor.keepMainFilePreview),
+      projectPathCompletion: booleanValue(editor.projectPathCompletion, defaultAppSettings.editor.projectPathCompletion),
+      fileDropImport: booleanValue(editor.fileDropImport, defaultAppSettings.editor.fileDropImport),
+      fileDropCreateFigures: booleanValue(editor.fileDropCreateFigures, defaultAppSettings.editor.fileDropCreateFigures),
+      fileDropImageDirectory: normalizeProjectRelativeDirectory(editor.fileDropImageDirectory),
+      fileDropDocumentDirectory: normalizeProjectRelativeDirectory(editor.fileDropDocumentDirectory),
+      insertionTemplates: normalizeInsertionTemplateLayer(editor.insertionTemplates),
       showZws: booleanValue(editor.showZws, defaultAppSettings.editor.showZws),
       userDictionary: Array.isArray(editor.userDictionary)
         ? [...new Set(editor.userDictionary.filter((word): word is string => typeof word === "string" && word.trim().length > 0).map(word => word.trim()))].sort()
@@ -281,8 +334,13 @@ export function normalizeAppSettings(value: unknown): AppSettings {
     },
     preview: {
       renderMode: previewRenderMode(preview.renderMode),
+      quality: normalizePreviewQualityMode(preview.quality),
       cursorSync: booleanValue(preview.cursorSync, defaultAppSettings.preview.cursorSync),
       syncDebounceMs: Math.round(boundedNumber(preview.syncDebounceMs, defaultAppSettings.preview.syncDebounceMs, 50, 2000)),
+      onTypeRateLimitSeconds: optionalPositiveInteger(
+        preview.onTypeRateLimitSeconds,
+        defaultAppSettings.preview.onTypeRateLimitSeconds
+      ),
       forwardSyncTimeoutMs: Math.round(boundedNumber(
         preview.forwardSyncTimeoutMs,
         defaultAppSettings.preview.forwardSyncTimeoutMs,
@@ -320,3 +378,8 @@ import {
   type CodeEditorFontId,
   type UnicodeFontPreference
 } from "./editor/fontCatalog";
+import { normalizeInsertionTemplateLayer } from "./editor/insertionTemplates";
+import {
+  normalizePreviewQualityMode,
+  type PreviewQualityMode
+} from "./preview/renderQuality";

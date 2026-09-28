@@ -68,8 +68,7 @@ export function participatesInPreviewCompilation(
 ): boolean {
   return importedByMain || (
     !!activePath
-    && !!pinnedMainPath
-    && filePathKey(activePath) === filePathKey(pinnedMainPath)
+    && (!pinnedMainPath || filePathKey(activePath) === filePathKey(pinnedMainPath))
   );
 }
 
